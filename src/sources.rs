@@ -3,20 +3,12 @@ mod diags;
 use cfg::ValidConfig;
 pub use diags::Code;
 
-use crate::{
-    LintLevel,
-    diag::{CfgCoord, Check, ErrorSink, Label, Pack},
-};
+use crate::diag::{CfgCoord, Check, ErrorSink, Label, Pack};
 
 const CRATES_IO_URL: &str = "https://github.com/rust-lang/crates.io-index";
 
 pub fn check(ctx: crate::CheckCtx<'_, ValidConfig>, sink: impl Into<ErrorSink>) {
     use bitvec::prelude::*;
-
-    // early out if everything is allowed
-    if ctx.cfg.unknown_registry == LintLevel::Allow && ctx.cfg.unknown_git == LintLevel::Allow {
-        return;
-    }
 
     let mut sink = sink.into();
 
@@ -43,7 +35,7 @@ pub fn check(ctx: crate::CheckCtx<'_, ValidConfig>, sink: impl Into<ErrorSink>) 
             None => continue,
         };
 
-        let mut pack = Pack::with_kid(Check::Sources, krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Sources, krate);
 
         let mut sl = None;
         let label = || {
@@ -64,6 +56,22 @@ pub fn check(ctx: crate::CheckCtx<'_, ValidConfig>, sink: impl Into<ErrorSink>) 
                     min_spec: *min,
                     actual_spec: spec,
                     min_spec_cfg: cfg_coord.clone(),
+                });
+            }
+
+            // Even when the source is explicitly allowed, the identity of the
+            // source must be internally consistent. In particular a `rev`
+            // dependency whose locked commit doesn't match the requested rev
+            // means the policy result and a subsequent build could be looking
+            // at two different commits.
+            if let Some(git) = source.git()
+                && !git.rev_matches_commit()
+            {
+                pack.push(diags::GitSourceCommitMismatch {
+                    src_label: sl.get_or_insert_with(label),
+                    rev: git.spec_value().unwrap_or_default().to_owned(),
+                    commit: git.commit().unwrap_or_default().to_owned(),
+                    repo: git.url().as_str().to_owned(),
                 });
             }
 
@@ -98,10 +106,8 @@ pub fn check(ctx: crate::CheckCtx<'_, ValidConfig>, sink: impl Into<ErrorSink>) 
             }
             .into()
         } else if let Some((orgt, orgname)) = krate.source.as_ref().and_then(|s| {
-            let crate::Source::Git { url, .. } = s else {
-                return None;
-            };
-            get_org(url)
+            let git = s.git()?;
+            get_org(git.url())
         }) {
             let lowered = (!orgname.is_ascii()).then(|| orgname.to_lowercase());
 

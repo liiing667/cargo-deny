@@ -85,7 +85,7 @@ impl<'k> Indices<'k> {
                     None,
                 ),
                 Source::Sparse(url) | Source::Registry(url) => Ok(url.as_str().into()),
-                Source::Git { .. } => unreachable!(),
+                Source::Git(_) => unreachable!(),
             };
 
             let index = index_url.and_then(|iu| {

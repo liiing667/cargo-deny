@@ -6,6 +6,14 @@
 
 A `git` source uses a specification that doesn't meet the minimum specifier required by [`sources.required-git-spec`](cfg.md#required-git-spec).
 
+### `git-source-commit-mismatch`
+
+A `rev` specified by a `git` dependency does not match the precise commit that was locked for that dependency.
+
+This means the manifest and the lockfile belong to different generations of the repository, so the source that was checked and the source a subsequent build would compile may not be the same commit. The finding lists the repository, the requested `rev`, and the locked commit. Re-resolve the dependency (eg. `cargo update`) so the lockfile and manifest agree before checking or building.
+
+This diagnostic is still emitted for git sources that are explicitly allowed by [`sources.allow-git`](cfg.md#allow-git).
+
 ### `allowed-source`
 
 A crate source is explicitly allowed by [`sources.allow-git`](cfg.md#allow-git) or [`sources.allow-registry`](cfg.md#allow-registry).

@@ -369,11 +369,11 @@ impl<'k> KrateSpans<'k> {
         okrates.sort_unstable_by_key(|(k, _s)| (&k.name, &k.version));
         for (krate, span) in &mut okrates {
             let span_start = sl.len();
-            let source = if krate.source.is_some() {
-                krate.id.source()
-            } else {
-                krate.manifest_path.parent().unwrap().as_str()
-            };
+            // Note that we intentionally use the crate's full source identity
+            // rather than the (commit-less) source from its package id, so that
+            // a policy result can always be attributed to the precise locked
+            // commit, even when a git dependency's ref has moved.
+            let source = krate.source_id();
 
             writeln!(sl, "{} {} {source}", krate.name, krate.version)
                 .expect("unable to synthesize lockfile");
@@ -751,24 +751,17 @@ fn read_workspace_deps<'k>(
 
         let mut matches_workspace_dep = |krate: &Krate| {
             match (&krate.source, &ws_src.source) {
-                (
-                    Some(crate::Source::Git {
-                        url,
-                        spec,
-                        spec_value,
-                    }),
-                    Source::Git { repo, spec: dspec },
-                ) => {
-                    if url.host_str() != repo.host_str()
-                        || url.path().trim_end_matches(".git")
+                (Some(crate::Source::Git(git)), Source::Git { repo, spec: dspec }) => {
+                    if git.url().host_str() != repo.host_str()
+                        || git.url().path().trim_end_matches(".git")
                             != repo.path().trim_end_matches(".git")
                     {
                         return false;
                     }
 
-                    let sv = spec_value.as_deref();
+                    let sv = git.spec_value();
 
-                    match (spec, dspec) {
+                    match (git.spec(), dspec) {
                         (crate::GitSpec::Any, GitSpec::None) => {}
                         (crate::GitSpec::Branch, GitSpec::None) if sv == Some("master") => {}
                         (crate::GitSpec::Branch, GitSpec::Branch(branch)) if sv == Some(branch) => {
@@ -776,6 +769,16 @@ fn read_workspace_deps<'k>(
                         (crate::GitSpec::Tag, GitSpec::Tag(tag)) if sv == Some(tag) => {}
                         (crate::GitSpec::Rev, GitSpec::Rev(rev)) if sv == Some(rev) => {}
                         _ => return false,
+                    }
+
+                    // A `rev` workspace dependency must resolve to the exact
+                    // commit that was requested; if the locked commit doesn't
+                    // match, the workspace dependency and the resolved package
+                    // belong to different generations and must not be conflated.
+                    if matches!((git.spec(), dspec), (crate::GitSpec::Rev, GitSpec::Rev(_)))
+                        && !git.rev_matches_commit()
+                    {
+                        return false;
                     }
                 }
                 (None, Source::Path(path)) => {
@@ -843,7 +846,7 @@ fn read_workspace_deps<'k>(
                                 return false;
                             }
                         }
-                        crate::Source::Git { .. } => return false,
+                        crate::Source::Git(_) => return false,
                     }
 
                     if let Some(req) = &ws_src.version {

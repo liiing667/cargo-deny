@@ -509,6 +509,7 @@ impl From<ExactFeaturesMismatch<'_>> for Diag {
             vec![GraphNode {
                 kid: efm.krate.id.clone(),
                 feature: None,
+                source: Some(efm.krate.source_id().into_owned()),
             }]
         } else {
             efm.not_allowed
@@ -516,6 +517,7 @@ impl From<ExactFeaturesMismatch<'_>> for Diag {
                 .map(|feat| GraphNode {
                     kid: efm.krate.id.clone(),
                     feature: Some((*feat).to_owned()),
+                    source: Some(efm.krate.source_id().into_owned()),
                 })
                 .collect()
         };
@@ -554,6 +556,7 @@ impl From<FeatureNotExplicitlyAllowed<'_>> for Diag {
             graph_nodes: std::iter::once(GraphNode {
                 kid: fna.krate.id.clone(),
                 feature: None,
+                source: Some(fna.krate.source_id().into_owned()),
             })
             .collect(),
             advisory: None,
@@ -586,6 +589,7 @@ impl From<FeatureBanned<'_>> for Diag {
             graph_nodes: std::iter::once(GraphNode {
                 kid: fed.krate.id.clone(),
                 feature: Some(fed.feature.value.clone()),
+                source: Some(fed.krate.source_id().into_owned()),
             })
             .collect(),
             advisory: None,
@@ -618,6 +622,7 @@ impl From<UnknownFeature<'_>> for Diag {
             graph_nodes: std::iter::once(GraphNode {
                 kid: uf.krate.id.clone(),
                 feature: None,
+                source: Some(uf.krate.source_id().into_owned()),
             })
             .collect(),
             advisory: None,
@@ -650,6 +655,7 @@ impl From<DefaultFeatureEnabled<'_>> for Diag {
             graph_nodes: std::iter::once(GraphNode {
                 kid: dfe.krate.id.clone(),
                 feature: Some("default".to_owned()),
+                source: Some(dfe.krate.source_id().into_owned()),
             })
             .collect(),
             advisory: None,

@@ -26,6 +26,14 @@ pub struct AdvisoryDb {
     pub path: PathBuf,
     /// The time of the last fetch of the db
     pub fetch_time: jiff::Timestamp,
+    /// The exact commit that was loaded from the database.
+    ///
+    /// This is the generation the advisories in [`Self::db`] came from. It is
+    /// recorded alongside the database so that a report, cache, or consumer
+    /// reading the database can always name the same commit, rather than
+    /// inferring it from mutable state such as `FETCH_HEAD` after a failed or
+    /// concurrent fetch.
+    pub commit: Option<crate::git::CommitIdentity>,
 }
 
 impl AdvisoryDb {
@@ -34,7 +42,7 @@ impl AdvisoryDb {
         let db_path = url_to_db_path(root_db_path, db_url)?;
 
         let fetch_start = std::time::Instant::now();
-        match fetch {
+        let commit = match fetch {
             Fetch::Allow => {
                 debug!("Fetching advisory database with git cli from '{db_url}'");
 
@@ -43,11 +51,15 @@ impl AdvisoryDb {
                 )?;
 
                 log::debug!("{res} {db_url}");
+                Some(res.into_commit())
             }
             Fetch::Disallow(_) => {
                 debug!("Opening advisory database at '{db_path}'");
+                // Record which generation is being read, even when fetching is
+                // disabled, so that consumers and reports can agree on it.
+                crate::git::head_commit(&db_path).ok()
             }
-        }
+        };
 
         // Verify that the repository is actually valid and that it is fresh
         let fetch_time = crate::git::get_fetch_time(&db_path)?;
@@ -81,7 +93,14 @@ impl AdvisoryDb {
             db,
             path: db_path,
             fetch_time,
+            commit,
         })
+    }
+
+    /// The identity of the commit the loaded advisories came from.
+    #[inline]
+    pub fn commit_identity(&self) -> Option<&crate::git::CommitIdentity> {
+        self.commit.as_ref()
     }
 }
 
@@ -90,6 +109,7 @@ impl fmt::Debug for AdvisoryDb {
         f.debug_struct("AdvisoryDb")
             .field("url", &self.url)
             .field("path", &self.path)
+            .field("commit", &self.commit)
             .finish()
     }
 }

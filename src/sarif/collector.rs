@@ -1,10 +1,7 @@
+use crate::diag::{self, DiagnosticCode, GraphNode, Pack, Severity};
 use crate::sarif::model::{
     ArtifactLocation, DefaultConfiguration, Driver, Help, Location, Message, PhysicalLocation,
     Region, Result as SarifResult, Rule, RuleProperties, Run, SarifLog, TextContent, Tool,
-};
-use crate::{
-    Kid,
-    diag::{self, DiagnosticCode, Pack, Severity},
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -19,7 +16,7 @@ pub struct SarifCollector {
 struct DiagnosticData {
     code: DiagnosticCode,
     severity: Severity,
-    krates: smallvec::SmallVec<[Kid; 2]>,
+    krates: smallvec::SmallVec<[GraphNode; 2]>,
     message: Message,
     locations: Vec<Location>,
     advisory_id: Option<String>,
@@ -78,7 +75,7 @@ impl SarifCollector {
             // Add to diagnostics
             self.diagnostics.push(DiagnosticData {
                 code,
-                krates: diag.graph_nodes.iter().map(|gn| gn.kid.clone()).collect(),
+                krates: diag.graph_nodes.iter().cloned().collect(),
                 severity: diag.diag.severity,
                 message,
                 locations,
@@ -134,13 +131,21 @@ impl SarifCollector {
                 }
 
                 if !diag.krates.is_empty() {
-                    for (i, kid) in diag.krates.into_iter().enumerate() {
+                    for (i, gn) in diag.krates.into_iter().enumerate() {
                         let mut fp = String::new();
+                        let GraphNode { kid, source, .. } = gn;
 
                         // Avoid including this in the fingerprint as in most projects
                         // this will be almost every crate and would just be noise
-                        if !kid.source().ends_with(tame_index::CRATES_IO_INDEX) {
-                            fp.push_str(kid.source());
+                        //
+                        // Prefer the full source identity (which retains the
+                        // locked commit for git sources) over the package id's
+                        // commit-less source, so that findings for two
+                        // generations of a git dependency can't share an alert
+                        // fingerprint.
+                        let source = source.as_deref().unwrap_or_else(|| kid.source());
+                        if !source.ends_with(tame_index::CRATES_IO_INDEX) {
+                            fp.push_str(source);
                             fp.push('#');
                         }
 

@@ -39,6 +39,8 @@ This configuration value allows you to control what specifiers you want to allow
 
 Configure which git urls are allowed for crate sources. If a crate's source is not in one of the listed urls, then the `unknown-git` setting will determine how it is handled. Note that the url must match exactly, though `.git` is stripped if it exists to match the logic of cargo.
 
+Only the repository part of a git source is matched. The branch/tag/rev, and the precise commit recorded in `Cargo.lock`, are intentionally ignored for matching, so an entry allows every ref of the repository. Findings still report the repository, the ref, and the locked commit so results from different generations of the same repository can be told apart. A `rev` dependency whose locked commit does not match the requested rev is reported as [`git-source-commit-mismatch`](diags.md#git-source-commit-mismatch) even when the source is explicitly allowed.
+
 ```toml
 [sources]
 allow-git = [

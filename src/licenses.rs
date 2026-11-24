@@ -252,7 +252,7 @@ pub fn check(
         .collect();
 
     for krate_lic_nfo in summary.nfos {
-        let mut pack = Pack::with_kid(Check::Licenses, krate_lic_nfo.krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Licenses, krate_lic_nfo.krate);
 
         // If the user has set this, check if it's a private workspace crate or
         // a crate from a private registry and just print out a help message
@@ -401,7 +401,10 @@ pub fn list(
     use std::{borrow::Cow, collections::BTreeMap, fmt::Write};
 
     #[derive(Ord, PartialOrd, PartialEq, Eq)]
-    struct SerKid<'k>(Cow<'k, Kid>);
+    struct SerKid<'k> {
+        kid: Cow<'k, Kid>,
+        source: Cow<'k, str>,
+    }
 
     impl serde::Serialize for SerKid<'_> {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -410,16 +413,16 @@ pub fn list(
         {
             serializer.serialize_str(&format!(
                 "{} {} {}",
-                self.0.name(),
-                self.0.version(),
-                self.0.source()
+                self.kid.name(),
+                self.kid.version(),
+                self.source
             ))
         }
     }
 
     impl SerKid<'_> {
         fn parts(&self) -> (&str, &str) {
-            (self.0.name(), self.0.version())
+            (self.kid.name(), self.kid.version())
         }
     }
 
@@ -444,8 +447,15 @@ pub fn list(
         }
     }
 
-    fn borrow(kid: &Kid) -> SerKid<'_> {
-        SerKid(Cow::Borrowed(kid))
+    fn borrow(krate: &crate::Krate) -> SerKid<'_> {
+        // Use the full source identity rather than the package id's source,
+        // which drops the precise commit for git dependencies. Without this,
+        // two generations of the same git dependency would produce the same
+        // output key and could be merged or cached as the same crate.
+        SerKid {
+            kid: Cow::Borrowed(&krate.id),
+            source: krate.source_id(),
+        }
     }
 
     let mut crate_layout = CrateLayout {
@@ -476,10 +486,10 @@ pub fn list(
                         }
 
                         match licenses.binary_search_by(|(r, _)| r.cmp(&s)) {
-                            Ok(i) => licenses[i].1.push(borrow(&krate_lic_nfo.krate.id)),
+                            Ok(i) => licenses[i].1.push(borrow(krate_lic_nfo.krate)),
                             Err(i) => {
                                 let mut v = Vec::with_capacity(20);
-                                v.push(borrow(&krate_lic_nfo.krate.id));
+                                v.push(borrow(krate_lic_nfo.krate));
                                 licenses.insert(i, (s.clone(), v));
                             }
                         }
@@ -487,13 +497,11 @@ pub fn list(
                     }
                 }
                 LicenseInfo::Unlicensed => {
-                    unlicensed.push(borrow(&krate_lic_nfo.krate.id));
+                    unlicensed.push(borrow(krate_lic_nfo.krate));
                 }
             }
 
-            crate_layout
-                .crates
-                .insert(SerKid(Cow::Owned(krate_lic_nfo.krate.id.clone())), cur);
+            crate_layout.crates.insert(borrow(krate_lic_nfo.krate), cur);
         }
     }
 

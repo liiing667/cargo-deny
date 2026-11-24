@@ -2,7 +2,7 @@
 
 pub use semver::Version;
 use std::{cmp, collections::BTreeMap, fmt};
-use url::Url;
+pub use url::Url;
 
 pub mod advisories;
 pub mod bans;
@@ -49,16 +49,143 @@ simple_enum!(
 
 enum_deser!(LintLevel);
 
+/// The identity of a crate sourced from a git repository.
+///
+/// Cargo identifies a git dependency by its repository, the requested
+/// branch/tag/revision (if any), and the *precise commit* the dependency was
+/// locked to in `Cargo.lock`. All three are retained together here; keeping the
+/// commit next to the repository and ref means a moved ref can never silently
+/// change the identity that a policy result (or a build) is attributed to.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GitSource {
+    /// The exact source string from cargo metadata, eg.
+    /// `git+https://github.com/foo/bar?branch=main#0123abcd`.
+    ///
+    /// This is the canonical, locked identity of the source and includes the
+    /// precise commit. It is used for reporting so that two resolutions of the
+    /// same repository/ref cannot be confused with each other.
+    raw: String,
+    /// The normalized source url: the repository plus its branch/tag/rev
+    /// specifier, without the commit fragment or any crates.io/git kind prefix.
+    ///
+    /// `allow-git`/`private` urls only match the repository portion of this
+    /// url; the specifier is intentionally ignored.
+    url: Url,
+    /// The kind of git specifier the dependency used.
+    spec: GitSpec,
+    /// The value of the specifier, eg. the branch/tag/rev name, if any.
+    spec_value: Option<String>,
+    /// The precise commit the dependency was locked to, extracted from the
+    /// `#<commit>` fragment of the source string.
+    commit: Option<String>,
+}
+
+impl GitSource {
+    /// The exact, locked source string as supplied by cargo metadata.
+    #[inline]
+    pub fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    /// The normalized repository url.
+    #[inline]
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The normalized repository url (alias for [`Self::url`]).
+    #[inline]
+    pub fn repository(&self) -> &Url {
+        &self.url
+    }
+
+    /// The kind of git specifier used by the dependency.
+    #[inline]
+    pub fn spec(&self) -> GitSpec {
+        self.spec
+    }
+
+    /// The branch/tag/rev value, if one was specified.
+    #[inline]
+    pub fn spec_value(&self) -> Option<&str> {
+        self.spec_value.as_deref()
+    }
+
+    /// The precise commit the dependency was locked to.
+    ///
+    /// Cargo always includes this for git dependencies that have been resolved
+    /// (ie, the package is present in `Cargo.lock`), but it can be missing for
+    /// hand-crafted metadata.
+    #[inline]
+    pub fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    /// The precise commit the dependency was locked to (alias for
+    /// [`Self::commit`]).
+    #[inline]
+    pub fn locked_commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    /// The branch/tag/rev value, if one was specified (alias for
+    /// [`Self::spec_value`]).
+    #[inline]
+    pub fn requested_ref(&self) -> Option<&str> {
+        self.spec_value.as_deref()
+    }
+
+    /// The canonical source identity, including the locked commit.
+    #[inline]
+    pub fn identity(&self) -> &str {
+        &self.raw
+    }
+
+    /// Returns `true` if the ref recorded in the manifest matches the commit
+    /// cargo actually locked the dependency to.
+    ///
+    /// Only `rev` specifiers can be verified offline, and only when the rev is
+    /// a hexadecimal commit prefix (cargo also accepts arbitrary revision
+    /// expressions such as `HEAD~1`, which cannot be compared to a commit
+    /// without resolving them). If the check can't be made, `true` is returned
+    /// so that valid, but unverifiable, sources are not rejected.
+    pub fn rev_matches_commit(&self) -> bool {
+        let (GitSpec::Rev, Some(rev), Some(commit)) = (self.spec, self.spec_value(), self.commit())
+        else {
+            return true;
+        };
+
+        let rev = rev.trim();
+        let commit = commit.trim();
+
+        // Short commit prefixes are allowed by git, but anything shorter than
+        // this isn't a commit sha and should not be treated as one.
+        if rev.len() < 4 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return true;
+        }
+
+        commit.len() >= rev.len()
+            && commit
+                .as_bytes()
+                .iter()
+                .zip(rev.as_bytes())
+                .all(|(c, r)| c.eq_ignore_ascii_case(r))
+    }
+}
+
+impl fmt::Display for GitSource {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Source {
     /// crates.io, the boolean indicates whether it is a sparse index
     CratesIo(bool),
-    /// A remote git patch
-    Git {
-        spec: GitSpec,
-        url: Url,
-        spec_value: Option<String>,
-    },
+    /// A remote git patch, bound to its repository, ref, and locked commit
+    Git(GitSource),
     /// A remote non-sparse registry index
     Registry(Url),
     /// A remote sparse index
@@ -107,7 +234,7 @@ impl Source {
     /// This method therefore assumes that the crates sources are laid out in the
     /// canonical cargo structure, though it can be rooted somewhere other than
     /// `CARGO_HOME`
-    fn from_metadata(urls: String, manifest_path: Option<&Path>) -> anyhow::Result<Self> {
+    pub fn from_metadata(urls: String, manifest_path: Option<&Path>) -> anyhow::Result<Self> {
         use anyhow::Context as _;
 
         let (kind, url_str) = urls
@@ -143,13 +270,15 @@ impl Source {
             }
             "git" => {
                 let mut url = Url::parse(url_str).context("failed to parse url")?;
-                let (spec, spec_value) = normalize_git_url(&mut url);
+                let (spec, spec_value, commit) = normalize_git_url(&mut url);
 
-                Ok(Self::Git {
+                Ok(Self::Git(GitSource {
+                    raw: urls,
                     url,
                     spec,
                     spec_value,
-                })
+                    commit,
+                }))
             }
             unknown => anyhow::bail!("unknown source spec '{unknown}' for url {urls}"),
         }
@@ -157,15 +286,37 @@ impl Source {
 
     #[inline]
     pub fn is_git(&self) -> bool {
-        matches!(self, Self::Git { .. })
+        matches!(self, Self::Git(_))
     }
 
     #[inline]
     pub fn git_spec(&self) -> Option<GitSpec> {
-        let Self::Git { spec, .. } = self else {
+        let Self::Git(git) = self else {
             return None;
         };
-        Some(*spec)
+        Some(git.spec)
+    }
+
+    /// Returns the git source details if this is a git source.
+    #[inline]
+    pub fn git(&self) -> Option<&GitSource> {
+        let Self::Git(git) = self else {
+            return None;
+        };
+        Some(git)
+    }
+
+    /// Returns the locked commit of a git source, if present.
+    #[inline]
+    pub fn git_commit(&self) -> Option<&str> {
+        self.git().and_then(GitSource::commit)
+    }
+
+    /// Returns the locked commit of a git source (alias for
+    /// [`Self::git_commit`]).
+    #[inline]
+    pub fn locked_commit(&self) -> Option<&str> {
+        self.git_commit()
     }
 
     #[inline]
@@ -199,7 +350,7 @@ impl Source {
                 kind == "registry" && url.as_str() == rurl
             }
             Self::Sparse(url) => url.as_str() == raw,
-            Self::Git { .. } => {
+            Self::Git(_) => {
                 // This isn't really relevant for now as this function is only used when checking
                 // yanked crates
                 false
@@ -227,9 +378,7 @@ impl fmt::Display for Source {
             Self::CratesIo(_) => {
                 write!(f, "registry+{}", tame_index::CRATES_IO_INDEX)
             }
-            Self::Git { url, .. } => {
-                write!(f, "git+{url}")
-            }
+            Self::Git(git) => write!(f, "{git}"),
             Self::Registry(url) => {
                 write!(f, "registry+{url}")
             }
@@ -370,9 +519,14 @@ impl Krate {
         })
     }
 
-    /// Determines if the specified url matches the source
+    /// Determines if the specified url matches the source.
+    ///
+    /// Note that only the repository part of a git source is matched; the
+    /// branch/tag/rev specifier, and the precise locked commit, are intentionally
+    /// ignored so that `sources.allow-git`/`sources.private` entries (which only
+    /// name a repository) continue to match every ref of that repository.
     #[inline]
-    pub(crate) fn matches_url(&self, url: &Url, exact: bool) -> bool {
+    pub fn matches_url(&self, url: &Url, exact: bool) -> bool {
         let Some(src) = &self.source else {
             return false;
         };
@@ -386,7 +540,8 @@ impl Krate {
                     .ends_with(&tame_index::CRATES_IO_HTTP_INDEX[8..])
                     || url.as_str().ends_with(&tame_index::CRATES_IO_INDEX[10..]);
             }
-            Source::Sparse(surl) | Source::Registry(surl) | Source::Git { url: surl, .. } => surl,
+            Source::Sparse(surl) | Source::Registry(surl) => surl,
+            Source::Git(git) => git.url(),
         };
 
         if kurl
@@ -398,22 +553,26 @@ impl Krate {
             return false;
         }
 
-        let (Some(khost), Some(host)) = (kurl.host(), url.host()) else {
-            return false;
-        };
-
-        match (khost, host) {
-            // We need to special case this because of how url parses eg. http vs non-http schemes
-            (url::Host::Domain(d), url::Host::Ipv4(v4)) => {
-                if !d.parse::<std::net::Ipv4Addr>().is_ok_and(|d| d == v4) {
-                    return false;
+        match (kurl.host(), url.host()) {
+            // Host-less urls, eg. `file:///path/to/repo` or `ssh:///path`,
+            // are compared by path below.
+            (None, None) => {}
+            (Some(khost), Some(host)) => {
+                match (khost, host) {
+                    // We need to special case this because of how url parses eg. http vs non-http schemes
+                    (url::Host::Domain(d), url::Host::Ipv4(v4)) => {
+                        if !d.parse::<std::net::Ipv4Addr>().is_ok_and(|d| d == v4) {
+                            return false;
+                        }
+                    }
+                    (khost, host) => {
+                        if khost != host {
+                            return false;
+                        }
+                    }
                 }
             }
-            (khost, host) => {
-                if khost != host {
-                    return false;
-                }
-            }
+            _ => return false,
         }
 
         // Configured urls go through `normalize_git_url`, which drops a trailing
@@ -436,6 +595,42 @@ impl Krate {
     #[inline]
     pub(crate) fn is_registry(&self) -> bool {
         self.source.as_ref().is_some_and(|src| src.is_registry())
+    }
+
+    /// The git source details, if this crate comes from a git repository.
+    #[inline]
+    pub fn git_source(&self) -> Option<&GitSource> {
+        self.source.as_ref().and_then(Source::git)
+    }
+
+    /// The precise commit this crate was locked to, if it comes from a git
+    /// repository.
+    ///
+    /// This is the commit recorded in `Cargo.lock`; it is the same commit a
+    /// subsequent build using that lockfile will compile.
+    #[inline]
+    pub fn git_commit(&self) -> Option<&str> {
+        self.git_source().and_then(GitSource::commit)
+    }
+
+    /// Alias for [`Self::git_commit`], emphasizing that the commit is the one
+    /// that was locked.
+    #[inline]
+    pub fn locked_commit(&self) -> Option<&str> {
+        self.git_commit()
+    }
+
+    /// The canonical identity of the crate's source.
+    ///
+    /// For git sources this includes the repository, the ref, **and** the
+    /// precise locked commit, unlike [`crate::Kid::source`] which drops the
+    /// commit. For all other sources (and local path crates) this is identical
+    /// to the source component of the crate's package id.
+    pub fn source_id(&self) -> std::borrow::Cow<'_, str> {
+        match &self.source {
+            Some(src) => std::borrow::Cow::Owned(src.to_string()),
+            None => std::borrow::Cow::Borrowed(self.id.source()),
+        }
     }
 }
 
@@ -521,8 +716,14 @@ use sources::cfg::GitSpec;
 ///
 /// See <https://github.com/rust-lang/cargo/blob/1f6c6bd5e7bbdf596f7e88e6db347af5268ab113/src/cargo/util/canonical_url.rs#L31-L57>
 /// for what cargo does
+///
+/// Returns the git specifier kind, its value, and the precise commit the source
+/// was locked to (the `#<commit>` fragment). The commit fragment is removed
+/// from the url so that repository matching cannot accidentally depend on the
+/// commit that happened to be locked; the commit is instead retained explicitly
+/// by [`GitSource`].
 #[inline]
-pub(crate) fn normalize_git_url(url: &mut Url) -> (GitSpec, Option<String>) {
+pub(crate) fn normalize_git_url(url: &mut Url) -> (GitSpec, Option<String>, Option<String>) {
     const GIT_EXT: &str = ".git";
 
     let needs_chopping = url.path().ends_with(&GIT_EXT);
@@ -575,7 +776,15 @@ pub(crate) fn normalize_git_url(url: &mut Url) -> (GitSpec, Option<String>) {
         }
     }
 
-    (spec, spec_value)
+    let commit = url.fragment().and_then(|fragment| {
+        let fragment = fragment.trim();
+        (!fragment.is_empty()).then(|| fragment.to_owned())
+    });
+    if commit.is_some() {
+        url.set_fragment(None);
+    }
+
+    (spec, spec_value, commit)
 }
 
 /// Helper function to convert a std `PathBuf` to a camino one

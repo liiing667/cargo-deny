@@ -27,7 +27,7 @@ expression: diags
           "column": 15,
           "line": 1,
           "message": "source",
-          "span": "git+https://github.com/dtolnay/anyhow?branch=master"
+          "span": "git+https://github.com/dtolnay/anyhow?branch=master#0a45d7665c32ba61788e09273bb17912ed402332"
         }
       ],
       "message": "detected 'git' source not explicitly allowed",
@@ -59,7 +59,7 @@ expression: diags
           "column": 15,
           "line": 11,
           "message": "source",
-          "span": "git+https://github.com/EmbarkStudios/krates?branch=main"
+          "span": "git+https://github.com/EmbarkStudios/krates?branch=main#6aa02ee69d69444c910f0ca04ccebb949d76e738"
         }
       ],
       "message": "detected 'git' source not explicitly allowed",
@@ -92,7 +92,7 @@ expression: diags
           "column": 17,
           "line": 13,
           "message": "source",
-          "span": "git+https://bitbucket.org/marshallpierce/line-wrap-rs"
+          "span": "git+https://bitbucket.org/marshallpierce/line-wrap-rs#41e42b9d95684d41615dd3d0aeeb1cfc4cc47225"
         }
       ],
       "message": "detected 'git' source not explicitly allowed",
@@ -125,7 +125,7 @@ expression: diags
           "column": 12,
           "line": 27,
           "message": "source",
-          "span": "git+https://github.com/EmbarkStudios/spdx?tag=0.3.4"
+          "span": "git+https://github.com/EmbarkStudios/spdx?tag=0.3.4#ba8dc9f0b164619771892b865f00236ebbd4cd39"
         }
       ],
       "message": "detected 'git' source not explicitly allowed",

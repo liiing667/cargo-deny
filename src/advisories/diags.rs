@@ -146,7 +146,7 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
 
         let md = &advisory.advisory;
 
-        let mut pack = Pack::with_kid(Check::Advisories, krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Advisories, krate);
         let mut ignore = None;
 
         let (severity, ty) = {
@@ -454,7 +454,7 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
         direct_dependents: Vec<krates::DirectDependent<'ctx, crate::Krate>>,
         indices: Option<&super::Indices<'_>>,
     ) -> Pack {
-        let mut pack = Pack::with_kid(Check::Advisories, krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Advisories, krate);
 
         let mut notes = Vec::new();
 
@@ -546,7 +546,7 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
     }
 
     pub(crate) fn diag_for_yanked_ignore(&self, krate: &crate::Krate, ignore: usize) -> Pack {
-        let mut pack = Pack::with_kid(Check::Advisories, krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Advisories, krate);
         pack.push(diag(
             Diagnostic::note()
                 .with_message(format_args!("yanked crate '{krate}' detected, but ignored",))
@@ -579,7 +579,7 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
             );
         }
 
-        let mut pack = Pack::with_kid(Check::Advisories, krate.id.clone());
+        let mut pack = Pack::with_krate(Check::Advisories, krate);
         pack.push(diag(
             Diagnostic::new(Severity::Warning)
                 .with_message("unable to check for yanked crates")

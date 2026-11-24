@@ -8,6 +8,7 @@ crate::simple_enum!(
     Code,
     [
         GitSourceUnderspecified = "git-source-underspecified",
+        GitSourceCommitMismatch = "git-source-commit-mismatch",
         AllowedSource = "allowed-source",
         AllowedByOrganization = "allowed-by-organization",
         SourceNotAllowed = "source-not-allowed",
@@ -22,6 +23,9 @@ impl Code {
         match self {
             Self::GitSourceUnderspecified => {
                 "A git source is using a looser specifier than was allowed"
+            }
+            Self::GitSourceCommitMismatch => {
+                "A git source's requested revision does not match its locked commit"
             }
             Self::AllowedSource => "A crate's source was explicitly allowed",
             Self::AllowedByOrganization => "A git source belonged to an allowed organization/owner",
@@ -67,6 +71,35 @@ impl<'a> From<BelowMinimumRequiredSpec<'a>> for Diag {
                         .with_message("minimum spec defined here"),
                 ]),
             Code::GitSourceUnderspecified,
+        )
+    }
+}
+
+pub(crate) struct GitSourceCommitMismatch<'a> {
+    pub(crate) src_label: &'a Label,
+    pub(crate) rev: String,
+    pub(crate) commit: String,
+    pub(crate) repo: String,
+}
+
+impl<'a> From<GitSourceCommitMismatch<'a>> for Diag {
+    fn from(gsmc: GitSourceCommitMismatch<'a>) -> Self {
+        diag(
+            Diagnostic::new(Severity::Error)
+                .with_message(format_args!(
+                    "'git' source requests rev '{}', but the locked commit is '{}'",
+                    gsmc.rev, gsmc.commit
+                ))
+                .with_labels(vec![gsmc.src_label.clone()])
+                .with_notes(vec![format!(
+                    "repository: {}\nrequested rev: {}\nlocked commit: {}\n\n\
+                     The source policy cannot prove that the requested revision and the \
+                     locked commit belong to the same generation; re-resolve the dependency \
+                     (eg. `cargo update`) so the lockfile and manifest agree before checking \
+                     or building.",
+                    gsmc.repo, gsmc.rev, gsmc.commit
+                )]),
+            Code::GitSourceCommitMismatch,
         )
     }
 }

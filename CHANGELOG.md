@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- Git dependency findings now retain the repository, the requested ref, and the precise commit from `Cargo.lock`, instead of dropping the commit when the crate's package id is used. This makes results from two generations of a repository distinguishable (including in SARIF fingerprints and `cargo deny list` output) after a branch or tag ref moves.
+- Git sources are always checked, even when they are explicitly allowed by `sources.allow-git` and both `sources.unknown-git`/`sources.unknown-registry` are set to `allow`. A `rev` dependency whose locked commit does not match the requested revision is now reported as `git-source-commit-mismatch`.
+- Fetching a git repository is now atomic. A failed fetch leaves the previous checkout at its previous commit and never publishes a half-updated generation, and a failed clone no longer leaves a partially cloned directory behind that a retry could mistake for a complete repository. `FetchResult` now reports the commit that was actually checked out.
+
 ## [0.22.0] - 2026-11-19
 ### Changed
 - [PR#923](https://github.com/EmbarkStudios/cargo-deny/pull/923) resolved [#920](https://github.com/EmbarkStudios/cargo-deny/issues/920) by emitting a new `advisory-withdrawn` diagnostic when an ignored advisory has been withdrawn in the advisory database and the ignore can be removed, instead of emitting `advisory-not-detected`.

@@ -233,9 +233,40 @@ pub enum SerializedAdvisory {
     Json(serde_json::Value),
 }
 
+#[derive(Clone, Debug)]
 pub struct GraphNode {
     pub kid: Kid,
     pub feature: Option<String>,
+    /// The full source identity of the crate, including the precise locked
+    /// commit for git sources.
+    ///
+    /// This is optional because some diagnostics only have a [`Kid`], which
+    /// drops the commit from git sources. Consumers that fingerprint or cache
+    /// findings should prefer this value when present.
+    pub source: Option<String>,
+}
+
+impl GraphNode {
+    /// Creates a node from a package id alone.
+    ///
+    /// Note that package ids do not retain the precise commit of git sources;
+    /// use [`Self::with_source`] when the full source identity is available.
+    pub fn new(kid: Kid, feature: Option<String>) -> Self {
+        Self {
+            kid,
+            feature,
+            source: None,
+        }
+    }
+
+    /// Creates a node with the full source identity of the crate.
+    pub fn with_source(kid: Kid, source: Option<String>, feature: Option<String>) -> Self {
+        Self {
+            kid,
+            feature,
+            source,
+        }
+    }
 }
 
 pub struct Diag {
@@ -278,7 +309,7 @@ pub enum Check {
 pub struct Pack {
     pub check: Check,
     pub(crate) diags: Vec<Diag>,
-    kid: Option<Kid>,
+    node: Option<GraphNode>,
 }
 
 impl Pack {
@@ -287,7 +318,7 @@ impl Pack {
         Self {
             check,
             diags: Vec::new(),
-            kid: None,
+            node: None,
         }
     }
 
@@ -296,7 +327,23 @@ impl Pack {
         Self {
             check,
             diags: Vec::new(),
-            kid: Some(kid),
+            node: Some(GraphNode::new(kid, None)),
+        }
+    }
+
+    /// Creates a pack for the specified crate, retaining its full source
+    /// identity (including a git source's locked commit) for any diagnostics
+    /// that are added to it.
+    #[inline]
+    pub(crate) fn with_krate(check: Check, krate: &crate::Krate) -> Self {
+        Self {
+            check,
+            diags: Vec::new(),
+            node: Some(GraphNode::with_source(
+                krate.id.clone(),
+                Some(krate.source_id().into_owned()),
+                None,
+            )),
         }
     }
 
@@ -304,9 +351,9 @@ impl Pack {
     pub(crate) fn push(&mut self, diag: impl Into<Diag>) -> &mut Diag {
         let mut diag = diag.into();
         if diag.graph_nodes.is_empty()
-            && let Some(kid) = self.kid.clone()
+            && let Some(node) = self.node.clone()
         {
-            diag.graph_nodes.push(GraphNode { kid, feature: None });
+            diag.graph_nodes.push(node);
         }
 
         self.diags.push(diag);
@@ -346,7 +393,7 @@ where
         Self {
             check,
             diags: vec![t.into()],
-            kid: None,
+            node: None,
         }
     }
 }

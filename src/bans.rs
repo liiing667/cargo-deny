@@ -467,6 +467,8 @@ pub fn check(
             id: Kid,
             /// Version, for deterministically ordering the duplicates
             version: semver::Version,
+            /// Full source identity, including the locked commit for git sources
+            source: String,
         }
 
         let mut kids = smallvec::SmallVec::<[Dupe; 2]>::new();
@@ -491,6 +493,7 @@ pub fn check(
                     Dupe {
                         id: krate.id.clone(),
                         version: krate.version.clone(),
+                        source: krate.source_id().into_owned(),
                     },
                 );
             }
@@ -511,6 +514,7 @@ pub fn check(
             diag.graph_nodes = kids
                 .into_iter()
                 .map(|dupe| crate::diag::GraphNode {
+                    source: Some(dupe.source),
                     kid: dupe.id,
                     feature: None,
                 })
@@ -593,7 +597,7 @@ pub fn check(
             let last = ctx.krates.len() - 1;
 
             for (i, krate) in ctx.krates.krates().enumerate() {
-                let mut pack = Pack::with_kid(Check::Bans, krate.id.clone());
+                let mut pack = Pack::with_krate(Check::Bans, krate);
 
                 // Check if the crate has been explicitly banned
                 if let Some(matches) = denied_ids.matches(krate) {
@@ -950,7 +954,7 @@ pub fn check(
                                 };
                                 let is_private = krate.is_private(&[]);
                                 let mut labels = Vec::new();
-                                let mut pack = Pack::with_kid(Check::Bans, krate.id.clone());
+                                let mut pack = Pack::with_krate(Check::Bans, krate);
 
                                 for mdep in manifest.deps(false) {
                                     if mdep.dep.req != VersionReq::STAR {
@@ -1833,7 +1837,7 @@ fn check_workspace_duplicates(
             continue;
         };
 
-        let mut pack = Pack::with_kid(Check::Bans, duplicate.id.clone());
+        let mut pack = Pack::with_krate(Check::Bans, duplicate);
         pack.push(diags::WorkspaceDuplicate {
             duplicate,
             labels,

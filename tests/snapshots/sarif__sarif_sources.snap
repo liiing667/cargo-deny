@@ -28,7 +28,7 @@ expression: s
           },
           "partialFingerprints": {
             "cargo-deny/id": "s:source-not-allowed",
-            "cargo-deny/krate": "git+https://github.com/dtolnay/anyhow?branch=master#anyhow@1.0.68"
+            "cargo-deny/krate": "git+https://github.com/dtolnay/anyhow?branch=master#0a45d7665c32ba61788e09273bb17912ed402332#anyhow@1.0.68"
           },
           "ruleId": "s:source-not-allowed"
         },

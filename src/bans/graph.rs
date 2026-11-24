@@ -1,5 +1,5 @@
 use super::cfg::GraphHighlight;
-use crate::{DepKind, Kid};
+use crate::{DepKind, Krate};
 use anyhow::{Context, Error};
 use krates::petgraph as pg;
 use std::{
@@ -51,7 +51,7 @@ const INDENT: &str = "    ";
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 struct DupNode<'k> {
-    kid: &'k Kid,
+    krate: &'k Krate,
     feature: Option<&'k str>,
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn create_graph(
 
     let duplicates: Vec<_> = dup_ids
         .iter()
-        .filter_map(|(di, skipped)| (!*skipped).then_some(krates[*di].id.clone()))
+        .filter_map(|(di, skipped)| (!*skipped).then_some(&krates[*di]))
         .collect();
 
     for (index, dupid) in dup_ids
@@ -79,7 +79,7 @@ pub(crate) fn create_graph(
         .zip(duplicates.iter())
     {
         let dn = DupNode {
-            kid: dupid,
+            krate: dupid,
             feature: None,
         };
         let nid = graph.add_node(dn);
@@ -100,7 +100,7 @@ pub(crate) fn create_graph(
                             | krates::Edge::DepFeature { kind, .. } = edge.weight()
                             {
                                 let dn = DupNode {
-                                    kid: &krate.id,
+                                    krate,
                                     feature: None,
                                 };
 
@@ -108,7 +108,7 @@ pub(crate) fn create_graph(
                                     graph.update_edge(*pindex, target, *kind);
                                 } else {
                                     let pindex = graph.add_node(DupNode {
-                                        kid: &krate.id,
+                                        krate,
                                         feature: None,
                                     });
 
@@ -139,7 +139,7 @@ pub(crate) fn create_graph(
                             | krates::Edge::DepFeature { kind, .. } = edge.weight()
                             {
                                 let node = DupNode {
-                                    kid: &krate.id,
+                                    krate,
                                     feature: None,
                                 };
 
@@ -156,10 +156,8 @@ pub(crate) fn create_graph(
                             }
                         }
                         krates::Node::Feature { krate_index, name } => {
-                            let kid = &krates[*krate_index].id;
-
                             let node = DupNode {
-                                kid,
+                                krate: &krates[*krate_index],
                                 feature: Some(name.as_str()),
                             };
 
@@ -189,7 +187,7 @@ pub(crate) fn create_graph(
     // any additional crate duplicates, to make them stand out more in the dotgraph
     for id in &duplicates {
         let dup_node = node_map[&DupNode {
-            kid: id,
+            krate: id,
             feature: None,
         }];
         let mut set = HashSet::new();
@@ -198,7 +196,7 @@ pub(crate) fn create_graph(
 
         while let Some(nid) = node_stack.pop() {
             let node = &graph[nid];
-            let name = node.kid.name();
+            let name = node.krate.id.name();
 
             match dupe_nodes.entry(name) {
                 Entry::Occupied(it) => {
@@ -253,15 +251,17 @@ pub(crate) fn create_graph(
                     ..Default::default()
                 }
             } else {
-                let kid = node_weight.kid;
+                let krate = node_weight.krate;
+                let kid = &krate.id;
 
                 let name = kid.name();
                 let version = kid.version();
-                let source = kid.source();
+                let source = krate.source_id();
 
                 if dupe_nodes.contains_key(name) {
                     // Add the source only if it is not crates.io
-                    let label = if source != "registry+https://github.com/rust-lang/crates.io-index"
+                    let label = if source.as_ref()
+                        != "registry+https://github.com/rust-lang/crates.io-index"
                     {
                         format!("{version} {source}").into()
                     } else {
