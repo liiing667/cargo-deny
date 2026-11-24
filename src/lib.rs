@@ -381,10 +381,15 @@ impl Krate {
             Source::CratesIo(_is_sparse) => {
                 // It's irrelevant if it's sparse or not for crates.io, they're the same
                 // index, just different protocols/kinds
-                return url
-                    .as_str()
-                    .ends_with(&tame_index::CRATES_IO_HTTP_INDEX[8..])
-                    || url.as_str().ends_with(&tame_index::CRATES_IO_INDEX[10..]);
+                //
+                // The match must be against the *canonical* crates.io indices
+                // however, a suffix comparison on the serialized url is not safe
+                // as it would also accept lookalike domains
+                // (eg. `https://index.crates.io.evil.com/`) or urls that embed
+                // the canonical index in a path on an entirely different host
+                // (eg. `https://evil.com/index.crates.io/`), which would let a
+                // malicious registry masquerade as crates.io.
+                return is_crates_io_index_url(url);
             }
             Source::Sparse(surl) | Source::Registry(surl) | Source::Git { url: surl, .. } => surl,
         };
@@ -419,8 +424,14 @@ impl Krate {
         // Configured urls go through `normalize_git_url`, which drops a trailing
         // slash, but registry index urls from cargo metadata keep theirs (sparse
         // indices always end with one), so an exact match ignores it on both sides
-        (exact && kurl.path().trim_end_matches('/') == url.path().trim_end_matches('/'))
-            || (!exact && kurl.path().starts_with(url.path()))
+        if exact {
+            kurl.path().trim_end_matches('/') == url.path().trim_end_matches('/')
+        } else {
+            // Inexact (eg. `private`) urls only match when the configured path
+            // is a prefix of the source path *on path segment boundaries*, so
+            // that `/internal/repos` can't match e.g. `/internal/repos-evil`.
+            path_has_prefix(kurl.path(), url.path())
+        }
     }
 
     #[inline]
@@ -514,6 +525,56 @@ pub fn match_krate(krate: &Krate, pid: &cfg::PackageSpec) -> bool {
 }
 
 use sources::cfg::GitSpec;
+
+/// Parses one of the canonical crates.io index urls, stripping any
+/// `sparse+`/`registry+` kind prefix that cargo uses in source ids.
+fn parse_canonical_index(raw: &str) -> Url {
+    let stripped = raw.split_once('+').map_or(raw, |(_kind, url)| url);
+    Url::parse(stripped).expect("the canonical crates.io index urls are valid urls")
+}
+
+/// Returns true if the url refers to one of the canonical crates.io registry
+/// indices. Unlike a plain string suffix comparison, this compares the url
+/// components so that lookalike domains or paths on other hosts can never be
+/// considered to be crates.io.
+fn is_crates_io_index_url(url: &Url) -> bool {
+    /// The canonical sparse crates.io index, `https://index.crates.io/`
+    static SPARSE: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+    /// The canonical git crates.io index,
+    /// `https://github.com/rust-lang/crates.io-index`
+    static GIT: std::sync::OnceLock<Url> = std::sync::OnceLock::new();
+
+    let same_origin = |canonical: &Url| {
+        url.scheme() == canonical.scheme()
+            && url.host() == canonical.host()
+            && url.port() == canonical.port()
+            && url.username() == canonical.username()
+            && url.password() == canonical.password()
+            // Registry index urls may or may not carry a trailing slash, but
+            // no other components are meaningful for the index identity.
+            && url.path().trim_end_matches('/') == canonical.path().trim_end_matches('/')
+            && url.query().is_none()
+            && url.fragment().is_none()
+    };
+
+    let sparse = SPARSE.get_or_init(|| parse_canonical_index(tame_index::CRATES_IO_HTTP_INDEX));
+    let git = GIT.get_or_init(|| parse_canonical_index(tame_index::CRATES_IO_INDEX));
+
+    same_origin(sparse) || same_origin(git)
+}
+
+/// Returns true if `prefix` is a prefix of `path` when both are split into
+/// `/` separated path segments. An empty prefix matches any path, while a
+/// partial segment such as `/internal/repos` does not match
+/// `/internal/repos-evil`.
+fn path_has_prefix(path: &str, prefix: &str) -> bool {
+    let mut path = path.split('/').filter(|segment| !segment.is_empty());
+
+    prefix
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .all(|segment| path.next() == Some(segment))
+}
 
 /// Normalizes the URL so that different representations can be compared to each other.
 ///
@@ -845,5 +906,161 @@ mod test {
         let url = Url::parse("ssh://git@repo1.test.org:8000").unwrap();
 
         assert!(krate.matches_url(&url, false));
+    }
+
+    #[test]
+    fn crates_io_matches_only_canonical_indices() {
+        let crates_io = [
+            // Both the git index and cargo's sparse index map to the same source
+            Source::from_metadata(format!("registry+{}", tame_index::CRATES_IO_INDEX), None)
+                .unwrap(),
+            Source::from_metadata(tame_index::CRATES_IO_HTTP_INDEX.to_owned(), None).unwrap(),
+        ];
+
+        // The two canonical representations, with or without a trailing slash
+        // and with an optional `sparse+`/`registry+` kind prefix
+        let allowed = [
+            tame_index::CRATES_IO_HTTP_INDEX,
+            "sparse+https://index.crates.io",
+            tame_index::CRATES_IO_INDEX,
+            "registry+https://github.com/rust-lang/crates.io-index/",
+        ];
+
+        for source in &crates_io {
+            let krate = Krate {
+                source: Some(source.clone()),
+                ..Krate::default()
+            };
+
+            for raw in allowed {
+                let url = Url::parse(raw.split_once('+').map_or(raw, |(_, u)| u)).unwrap();
+                assert!(
+                    krate.matches_url(&url, true),
+                    "crates.io source should match canonical url '{raw}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crates_io_rejects_lookalike_domains_and_path_embeds() {
+        let krate = Krate {
+            source: Some(
+                Source::from_metadata(format!("registry+{}", tame_index::CRATES_IO_INDEX), None)
+                    .unwrap(),
+            ),
+            ..Krate::default()
+        };
+
+        // None of these must be treated as crates.io, even though the old
+        // suffix-based comparison accepted them.
+        for evil in [
+            // lookalike / suffix domains
+            "https://index.crates.io.evil.com/",
+            "https://evil-index.crates.io/",
+            "https://index.crates.io@evil.com/",
+            // canonical index embedded in another host's path
+            "https://evil.com/index.crates.io/",
+            "https://evil.com/github.com/rust-lang/crates.io-index",
+            // canonical host with a path prefix/suffix
+            "https://index.crates.io.evil.com/github.com/rust-lang/crates.io-index",
+            "https://github.com/rust-lang/crates.io-index-evil",
+            "https://github.com/evil-org/crates.io-index",
+            // wrong scheme
+            "http://index.crates.io/",
+        ] {
+            let url = Url::parse(evil).unwrap();
+            assert!(
+                !krate.matches_url(&url, true),
+                "lookalike url '{evil}' must not match crates.io"
+            );
+        }
+    }
+
+    #[test]
+    fn non_crates_io_registry_never_matches_crates_io_allowance() {
+        // A malicious registry that happens to be hosted on a crates.io-like
+        // url must retain its own identity instead of being allowed as crates.io
+        for raw in [
+            "sparse+https://index.crates.io.evil.com/",
+            "registry+https://evil.com/github.com/rust-lang/crates.io-index",
+            "sparse+https://example.com/index.crates.io/",
+        ] {
+            let krate = Krate {
+                source: Some(Source::from_metadata(raw.to_owned(), None).unwrap()),
+                ..Krate::default()
+            };
+
+            assert!(!krate.is_crates_io(), "'{raw}' is not crates.io");
+
+            let canonical = Url::parse("https://index.crates.io/").unwrap();
+            assert!(
+                !krate.matches_url(&canonical, true),
+                "'{raw}' must not be allowed by the canonical crates.io url"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_registry_match_requires_full_path() {
+        let krate = Krate {
+            source: Some(
+                Source::from_metadata(
+                    "sparse+https://registry.example.com/team-a/index/".to_owned(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            ..Krate::default()
+        };
+
+        // Same path, trailing slash differences are still tolerated
+        assert!(krate.matches_url(
+            &Url::parse("https://registry.example.com/team-a/index").unwrap(),
+            true
+        ));
+
+        // Prefix/suffix paths are different registries and must not match
+        for other in [
+            "https://registry.example.com/team-a",
+            "https://registry.example.com/team-a/index-evil",
+            "https://registry.example.com/evil/team-a/index",
+            "https://registry.example.com/team-a/index/extra",
+        ] {
+            assert!(
+                !krate.matches_url(&Url::parse(other).unwrap(), true),
+                "'{other}' must not exactly match the registry"
+            );
+        }
+    }
+
+    #[test]
+    fn inexact_match_respects_path_segment_boundaries() {
+        let krate = Krate {
+            source: Some(
+                Source::from_metadata(
+                    "git+ssh://git@internal-host/repos-evil/team-a/repo.git".to_owned(),
+                    None,
+                )
+                .unwrap(),
+            ),
+            ..Krate::default()
+        };
+
+        // A path-prefix allowance (`private`) matches repos beneath it...
+        assert!(krate.matches_url(
+            &Url::parse("ssh://git@internal-host/repos-evil").unwrap(),
+            false
+        ));
+        // ...including a host-only allowance
+        assert!(krate.matches_url(&Url::parse("ssh://git@internal-host").unwrap(), false));
+
+        // ...but not a sibling directory that merely shares a string prefix,
+        // which a naive `starts_with` comparison would accept
+        assert!(!krate.matches_url(&Url::parse("ssh://git@internal-host/repos").unwrap(), false));
+        assert!(!krate.matches_url(
+            &Url::parse("ssh://git@internal-host/repos-evil/team").unwrap(),
+            false
+        ));
     }
 }

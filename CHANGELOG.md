@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- Source url matching for the `sources` check now only treats the canonical crates.io indices (`https://index.crates.io` and `https://github.com/rust-lang/crates.io-index`) as crates.io instead of using a string suffix comparison that could be fooled by lookalike domains or urls with the canonical index embedded in the path. Inexact (`private`) source matching now also respects path segment boundaries so a configured prefix can no longer match a sibling path such as `/repos` matching `/repos-evil`.
 ## [0.22.0] - 2026-11-19
 ### Changed
 - [PR#923](https://github.com/EmbarkStudios/cargo-deny/pull/923) resolved [#920](https://github.com/EmbarkStudios/cargo-deny/issues/920) by emitting a new `advisory-withdrawn` diagnostic when an ignored advisory has been withdrawn in the advisory database and the ignore can be removed, instead of emitting `advisory-not-detected`.
