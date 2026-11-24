@@ -70,6 +70,7 @@ expression: unique
     "unnecessary-skip",
     "unresolved-workspace-dependency",
     "unsound",
+    "unused-feature",
     "unused-workspace-dependency",
     "unused-wrapper",
     "vulnerability",

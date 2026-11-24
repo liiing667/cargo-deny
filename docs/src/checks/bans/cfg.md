@@ -200,6 +200,7 @@ Denies specific features for the crate.
 #### `features.allow`
 
 Allows specific features for the crate, enabled features not in this list are denied.
+Allowed features that exist for the crate but are not enabled are reported with the [`unused-feature`](diags.md#unused-feature) diagnostic.
 
 #### `features.exact`
 

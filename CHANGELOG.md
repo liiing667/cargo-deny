@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- Feature checks now use the actual feature nodes and dependency edges in the crate graph instead of the flat feature list from cargo metadata. This makes `bans.features.allow` and `bans.features.deny` agree on which features are enabled, ensures denied features are still reported when an exact allow list is used, includes the enabled feature in inclusion graphs, and emits an `unused-feature` warning for allowed features that are not enabled.
+
 ## [0.22.0] - 2026-11-19
 ### Changed
 - [PR#923](https://github.com/EmbarkStudios/cargo-deny/pull/923) resolved [#920](https://github.com/EmbarkStudios/cargo-deny/issues/920) by emitting a new `advisory-withdrawn` diagnostic when an ignored advisory has been withdrawn in the advisory database and the ignore can be removed, instead of emitting `advisory-not-detected`.

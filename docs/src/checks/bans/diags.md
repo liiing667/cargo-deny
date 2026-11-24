@@ -90,6 +90,10 @@ An enabled crate feature is present in the [`bans.features.deny`](cfg.md#feature
 
 A feature in either [`bans.features.deny`](cfg.md#features-deny) or [`bans.features.allow`](cfg.md#features-allow) does not exist for the crate.
 
+### `unused-feature`
+
+A feature in [`bans.features.allow`](cfg.md#features-allow) is not enabled for a crate that matched its configuration, and can be removed.
+
 ### `default-feature-enabled`
 
 The `default` feature was enabled on a crate, and the [`bans.external-default-features`](cfg.md#external-default-features) or [`bans.workspace-default-features`](cfg.md#workspace-default-features) was configured.

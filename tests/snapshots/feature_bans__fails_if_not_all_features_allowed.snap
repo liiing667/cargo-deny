@@ -16,12 +16,6 @@ expression: diags
             {
               "Feature": {
                 "crate_name": "features-galore",
-                "name": "ssh"
-              }
-            },
-            {
-              "Feature": {
-                "crate_name": "features-galore",
                 "name": "zlib"
               }
             }

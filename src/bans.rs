@@ -15,6 +15,61 @@ use krates::cm::DependencyKind;
 use semver::VersionReq;
 use std::fmt;
 
+/// Finds the features that are actually enabled for a crate.
+///
+/// The feature set stored on a crate node can contain features that were
+/// reported by cargo metadata but were not actually added to the dependency
+/// graph, eg. because the dependency edge that would have enabled them was
+/// filtered out. Walk the incoming feature edges instead so that both the
+/// allow and deny checks, as well as the inclusion graphs in diagnostics, are
+/// based on the real feature nodes in the graph.
+fn find_enabled_features<'a>(krates: &'a Krates, kid: &Kid) -> Vec<&'a str> {
+    use krates::petgraph::{Direction, visit::EdgeRef};
+
+    let Some((nid, _)) = krates.get_node(kid, None) else {
+        return Vec::new();
+    };
+
+    let graph = krates.graph();
+    let mut features: Vec<_> = graph
+        .edges_directed(nid, Direction::Incoming)
+        .filter_map(|edge| {
+            if let krates::Node::Feature { krate_index, name } = &graph[edge.source()]
+                && *krate_index == nid
+            {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    features.sort_unstable();
+    features.dedup();
+    features
+}
+
+/// Determines whether allowing `parent` also allows `feature`.
+fn has_feature(
+    map: &std::collections::BTreeMap<String, Vec<String>>,
+    parent: &str,
+    feature: &str,
+) -> bool {
+    if let Some(parent) = map.get(parent) {
+        parent.iter().any(|sub_feature| {
+            let parsed = krates::ParsedFeature::from(sub_feature.as_str());
+
+            if let krates::Feature::Simple(sub_feature) = parsed.feat() {
+                sub_feature == feature || has_feature(map, sub_feature, feature)
+            } else {
+                false
+            }
+        })
+    } else {
+        false
+    }
+}
+
 struct ReqMatch<'vr> {
     specr: &'vr SpecAndReason,
     index: usize,
@@ -692,9 +747,9 @@ pub fn check(
                     }
                 }
 
-                let enabled_features = ctx.krates.get_enabled_features(&krate.id).unwrap();
+                let enabled_features = find_enabled_features(ctx.krates, &krate.id);
 
-                let default_lint_level = if enabled_features.contains("default") {
+                let default_lint_level = if enabled_features.contains(&"default") {
                     if ctx.krates.workspace_members().any(|n| {
                         if let krates::Node::Krate { id, .. } = n {
                             id == &krate.id
@@ -724,13 +779,31 @@ pub fn check(
                 if let Some(matches) = feature_ids.matches(krate) {
                     for rm in matches {
                         let feature_bans = &features[rm.index];
+                        let mut allow_hits: BitVec =
+                            BitVec::repeat(false, feature_bans.allow.value.len());
+                        let mut allow_known: BitVec =
+                            BitVec::repeat(false, feature_bans.allow.value.len());
 
-                        let feature_set_allowed = {
+                        for (i, feature) in feature_bans.allow.value.iter().enumerate() {
+                            if krate.features.contains_key(&feature.value) {
+                                allow_known.set(i, true);
+                            }
+
+                            if enabled_features.iter().any(|enabled| {
+                                feature.value == *enabled
+                                    || has_feature(&krate.features, feature.value.as_str(), enabled)
+                            }) {
+                                allow_hits.set(i, true);
+                            }
+                        }
+
+                        let mut feature_set_allowed = {
                             // Gather features that were present, but not explicitly allowed
                             let not_explicitly_allowed: Vec<_> = enabled_features
                                 .iter()
                                 .filter_map(|ef| {
-                                    if !feature_bans.allow.value.iter().any(|af| &af.value == ef) {
+                                    let ef = *ef;
+                                    if !feature_bans.allow.value.iter().any(|af| af.value == ef) {
                                         if ef == "default"
                                             && let Some(ll) = default_lint_level
                                             && ll.value != LintLevel::Deny
@@ -738,7 +811,7 @@ pub fn check(
                                             return None;
                                         }
 
-                                        Some(ef.as_str())
+                                        Some(ef)
                                     } else {
                                         None
                                     }
@@ -752,7 +825,7 @@ pub fn check(
                                     .value
                                     .iter()
                                     .filter_map(|af| {
-                                        if !enabled_features.contains(&af.value) {
+                                        if !enabled_features.contains(&af.value.as_str()) {
                                             Some(CfgCoord {
                                                 file: file_id,
                                                 span: af.span,
@@ -790,32 +863,6 @@ pub fn check(
                                         // can also look at the full tree of features to
                                         // determine if the feature is covered by an allowed
                                         // parent feature
-                                        fn has_feature(
-                                            map: &std::collections::BTreeMap<String, Vec<String>>,
-                                            parent: &str,
-                                            feature: &str,
-                                        ) -> bool {
-                                            if let Some(parent) = map.get(parent) {
-                                                parent.iter().any(|f| {
-                                                    let pf =
-                                                        krates::ParsedFeature::from(f.as_str());
-
-                                                    if let krates::Feature::Simple(feat) = pf.feat()
-                                                    {
-                                                        if feat == feature {
-                                                            true
-                                                        } else {
-                                                            has_feature(map, feat, feature)
-                                                        }
-                                                    } else {
-                                                        false
-                                                    }
-                                                })
-                                            } else {
-                                                false
-                                            }
-                                        }
-
                                         if !feature_bans.allow.value.iter().any(|allowed| {
                                             has_feature(
                                                 &krate.features,
@@ -856,21 +903,46 @@ pub fn check(
                                     });
                                 }
 
-                                for feature in feature_bans
-                                    .deny
-                                    .iter()
-                                    .filter(|feat| enabled_features.contains(&feat.value))
-                                {
-                                    pack.push(diags::FeatureBanned {
+                                diag_count <= pack.len()
+                            }
+                        };
+
+                        // Explicitly denied features must be checked regardless of
+                        // whether the configured allow list is exact, otherwise an
+                        // allowed feature that enables a denied feature would swallow
+                        // the denial.
+                        let diag_count = pack.len();
+                        for feature in feature_bans
+                            .deny
+                            .iter()
+                            .filter(|feat| enabled_features.contains(&feat.value.as_str()))
+                        {
+                            pack.push(diags::FeatureBanned {
+                                krate,
+                                feature,
+                                file_id,
+                            });
+                        }
+
+                        if diag_count != pack.len() {
+                            feature_set_allowed = false;
+                        }
+
+                        if !feature_bans.exact.value {
+                            for ((known, hit), feature) in allow_known
+                                .iter()
+                                .zip(allow_hits.iter())
+                                .zip(feature_bans.allow.value.iter())
+                            {
+                                if *known && !*hit {
+                                    pack.push(diags::UnusedFeature {
                                         krate,
                                         feature,
                                         file_id,
                                     });
                                 }
-
-                                diag_count <= pack.len()
                             }
-                        };
+                        }
 
                         // If the crate isn't actually banned, but does reference
                         // features that don't exist, emit warnings about them so
@@ -1313,12 +1385,12 @@ pub fn check_build(
                     }
                 }
 
-                let enabled = krates.get_enabled_features(&krate.id).unwrap();
+                let enabled = find_enabled_features(krates, &krate.id);
 
                 let enabled_features: Vec<_> = kc
                     .required_features
                     .iter()
-                    .filter(|f| enabled.contains(&f.value))
+                    .filter(|f| enabled.contains(&f.value.as_str()))
                     .collect();
 
                 // If none of the required-features are present then we

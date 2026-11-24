@@ -30,6 +30,7 @@ crate::simple_enum!(
         FeatureNotExplicitlyAllowed = "feature-not-explicitly-allowed",
         FeatureBanned = "feature-banned",
         UnknownFeature = "unknown-feature",
+        UnusedFeature = "unused-feature",
         DefaultFeatureEnabled = "default-feature-enabled",
         PathBypassed = "path-bypassed",
         PathBypassedByGlob = "path-bypassed-by-glob",
@@ -87,6 +88,7 @@ impl Code {
             Self::UnknownFeature => {
                 "Attempted to allow or ban a feature for a crate which doesn't exist"
             }
+            Self::UnusedFeature => "An allowed feature was not enabled for the crate",
             Self::DefaultFeatureEnabled => "Default features were enabled for a crate",
             Self::PathBypassed => {
                 "A path was explicitly allowed when checking build time execution"
@@ -553,7 +555,7 @@ impl From<FeatureNotExplicitlyAllowed<'_>> for Diag {
             code: dcode(Code::FeatureNotExplicitlyAllowed),
             graph_nodes: std::iter::once(GraphNode {
                 kid: fna.krate.id.clone(),
-                feature: None,
+                feature: Some(fna.feature.to_owned()),
             })
             .collect(),
             advisory: None,
@@ -623,6 +625,34 @@ impl From<UnknownFeature<'_>> for Diag {
             advisory: None,
             with_features: false,
         }
+    }
+}
+
+pub(crate) struct UnusedFeature<'a> {
+    pub(crate) krate: &'a Krate,
+    pub(crate) feature: &'a Spanned<String>,
+    pub(crate) file_id: FileId,
+}
+
+impl From<UnusedFeature<'_>> for Diag {
+    fn from(uf: UnusedFeature<'_>) -> Self {
+        let diagnostic = Diagnostic::new(Severity::Warning)
+            .with_message(format_args!(
+                "feature '{}' for crate '{}' is allowed but unused",
+                uf.feature.value, uf.krate,
+            ))
+            .with_code(Code::UnusedFeature)
+            .with_labels(vec![
+                Label::primary(uf.file_id, uf.feature.span).with_message("unused allowed feature"),
+            ]);
+
+        let mut diag = diag(diagnostic, Code::UnusedFeature);
+        diag.graph_nodes = std::iter::once(GraphNode {
+            kid: uf.krate.id.clone(),
+            feature: None,
+        })
+        .collect();
+        diag
     }
 }
 
