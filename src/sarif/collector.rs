@@ -43,12 +43,12 @@ impl SarifCollector {
     pub fn add_diagnostics(&mut self, pack: Pack, files: &crate::diag::Files) {
         for diag in pack {
             let Some(code) = diag.code else {
-                return;
+                continue;
             };
 
             // Filter out note and help severities - SARIF should only contain actionable issues
             if matches!(diag.diag.severity, Severity::Note | Severity::Help) {
-                return;
+                continue;
             }
 
             let locations = diag
@@ -244,5 +244,72 @@ fn get_rule_tags(code: DiagnosticCode) -> &'static [&'static str] {
         DiagnosticCode::Bans(_) => &["dependencies", "supply-chain"],
         DiagnosticCode::Source(_) => &["sources", "supply-chain"],
         DiagnosticCode::General(_) => &["cargo-deny"],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diag::{Check, Diagnostic, Files, Label};
+
+    /// Diagnostics that are filtered out of the SARIF log (notes, helps, or
+    /// diagnostics without a code) must not cause the remaining diagnostics
+    /// in the same pack to be dropped, otherwise the emitted rules and
+    /// locations no longer match the actual findings
+    #[test]
+    fn filtered_diagnostics_dont_drop_findings() {
+        let mut files = Files::new();
+        let file_id = files.add("Cargo.toml", "[dependencies]\nfoo = \"1\"\n");
+
+        let mut pack = Pack::new(Check::Bans);
+
+        // Notes are filtered from the SARIF log...
+        pack.push((
+            Diagnostic::new(Severity::Note).with_message("crate is allowed"),
+            Some(DiagnosticCode::Bans(crate::bans::Code::Allowed)),
+        ));
+        // ...but the actual finding that follows must still be collected
+        pack.push((
+            Diagnostic::new(Severity::Error)
+                .with_message("crate is banned")
+                .with_labels(vec![Label::primary(file_id, 15..18)]),
+            Some(DiagnosticCode::Bans(crate::bans::Code::Banned)),
+        ));
+        // Diagnostics without a code are skipped as well...
+        pack.push((
+            Diagnostic::new(Severity::Warning).with_message("no code"),
+            None,
+        ));
+        // ...and must not drop the findings that come after them either
+        pack.push((
+            Diagnostic::new(Severity::Warning).with_message("wildcard version"),
+            Some(DiagnosticCode::Bans(crate::bans::Code::Wildcard)),
+        ));
+
+        let mut sc = SarifCollector::new("");
+        sc.add_diagnostics(pack, &files);
+        let sarif = sc.generate_sarif();
+
+        let run = &sarif.runs[0];
+
+        // Both actionable findings are present and point at the check (rule)
+        // that actually produced them
+        assert_eq!(run.results.len(), 2);
+        assert_eq!(run.results[0].rule_id, "b:banned");
+        assert_eq!(run.results[1].rule_id, "b:wildcard");
+
+        // The finding points at its real file location
+        let loc = &run.results[0].locations[0];
+        assert_eq!(
+            loc.physical_location.artifact_location.uri,
+            "file://Cargo.toml"
+        );
+        assert_eq!(loc.physical_location.region.byte_offset, 15);
+        assert_eq!(loc.physical_location.region.byte_length, 3);
+
+        // Only the rules for the collected findings are emitted
+        assert_eq!(run.tool.driver.rules.len(), 2);
+        assert_eq!(run.tool.driver.rules[0].id, "b:banned");
+        assert_eq!(run.tool.driver.rules[1].id, "b:wildcard");
     }
 }

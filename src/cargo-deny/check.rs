@@ -641,13 +641,17 @@ fn print_diagnostics(
         }
 
         let sarif = sc.generate_sarif();
-        let json = serde_json::to_string_pretty(&sarif).unwrap();
+        // Serialize the entire log up front and emit it in a single write so
+        // that a failure can't leave a partially written log behind, eg. when
+        // stdout is redirected to a file
+        let mut json = serde_json::to_string_pretty(&sarif).unwrap();
+        json.push('\n');
+
         // Output to stdout for SARIF format
-        use std::io::Write;
-        {
-            let mut lock = std::io::stdout();
-            let _ = lock.write_all(json.as_bytes());
-            let _ = lock.write_all(b"\n");
+        use std::io::Write as _;
+        let mut lock = std::io::stdout().lock();
+        if let Err(err) = lock.write_all(json.as_bytes()) {
+            log::error!("failed to write SARIF log: {err}");
         }
     } else {
         let dp = crate::common::DiagPrinter::new(log_ctx, krates, feature_depth);

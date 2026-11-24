@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
+### Fixed
+- Fixed SARIF output so that a filtered diagnostic (a note, help, or codeless diagnostic) no longer causes the remaining diagnostics in the same crate pack to be dropped, which meant SARIF rules and file locations could be missing for actual findings when several lints hit the same crate. The SARIF log is also now serialized and written in a single operation, with write failures reported, instead of being emitted as multiple unchecked writes that could leave a partially written file behind.
+
 ## [0.22.0] - 2026-11-19
 ### Changed
 - [PR#923](https://github.com/EmbarkStudios/cargo-deny/pull/923) resolved [#920](https://github.com/EmbarkStudios/cargo-deny/issues/920) by emitting a new `advisory-withdrawn` diagnostic when an ignored advisory has been withdrawn in the advisory database and the ignore can be removed, instead of emitting `advisory-not-detected`.
