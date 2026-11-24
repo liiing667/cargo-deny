@@ -179,6 +179,26 @@ pub struct Report<'db, 'k> {
     pub serialized_reports: Vec<serde_json::Value>,
 }
 
+/// Canonical strength/precedence for two records carrying the same advisory
+/// id.
+///
+/// Strong, live vulnerability records win over informational advisories and
+/// withdrawn tombstones. Ties are resolved by stable caller-controlled order
+/// or path, so a weaker record encountered first cannot swallow a strong
+/// finding.
+fn advisory_precedence(advisory: &model::Advisory<'_>) -> u8 {
+    if advisory.advisory.withdrawn.is_some() {
+        return 5;
+    }
+
+    match advisory.advisory.informational {
+        None => 0,
+        Some(model::Informational::Unsound) => 1,
+        Some(model::Informational::Unmaintained) => 2,
+        Some(model::Informational::Notice | model::Informational::Other(_)) => 3,
+    }
+}
+
 impl<'db, 'k> Report<'db, 'k> {
     pub fn generate(
         cfg: &crate::advisories::cfg::ValidConfig,
@@ -223,6 +243,17 @@ impl<'db, 'k> Report<'db, 'k> {
                     (!matched.is_empty()).then_some((&entry.advisory, matched))
                 })
                 .collect();
+
+            // Rayon currently preserves the order of the `BTreeMap` iterator,
+            // but sorting here makes the report boundary independent of that
+            // implementation detail and of the order in which database entries
+            // were walked from disk.
+            db_advisories.sort_by(|(a, _), (b, _)| {
+                a.advisory
+                    .id
+                    .cmp(b.advisory.id)
+                    .then_with(|| advisory_precedence(a).cmp(&advisory_precedence(b)))
+            });
 
             if serialize_reports {
                 let mut warnings =
@@ -272,33 +303,59 @@ impl<'db, 'k> Report<'db, 'k> {
                             }));
                         }
                     }
-
-                    serialized_reports.push(serde_json::json!({
-                        // This is extremely cargo-audit specific, we fill it out a bit lazily
-                        "settings": serde_json::json!({
-                            "target_arch": [],
-                            "target_os": [],
-                            "severity": serde_json::Value::Null,
-                            "ignore": serde_json::Value::Array(cfg.ignore.iter().map(|i| serde_json::Value::String(i.id.value.clone())).collect()),
-                            "informational_warnings": [
-                                "notice",
-                                "unmaintained",
-                                "unsound",
-                            ],
-                        }),
-                        "lockfile": {
-                            "dependency-count": krates.len(),
-                        },
-                        "vulnerabilities": vulns,
-                        "warnings": warnings,
-                    }));
                 }
+
+                // cargo-audit compatibility uses one report per database.
+                // Building it after all advisories have been aggregated also
+                // avoids emitting order-dependent cumulative partial reports.
+                serialized_reports.push(serde_json::json!({
+                    // This is extremely cargo-audit specific, we fill it out a bit lazily
+                    "settings": serde_json::json!({
+                        "target_arch": [],
+                        "target_os": [],
+                        "severity": serde_json::Value::Null,
+                        "ignore": serde_json::Value::Array(cfg.ignore.iter().map(|i| serde_json::Value::String(i.id.value.clone())).collect()),
+                        "informational_warnings": [
+                            "notice",
+                            "unmaintained",
+                            "unsound",
+                        ],
+                    }),
+                    "lockfile": {
+                        "dependency-count": krates.len(),
+                    },
+                    "vulnerabilities": vulns,
+                    "warnings": warnings,
+                }));
             }
 
             advisories.append(&mut db_advisories);
         }
 
-        advisories.sort_by_key(|(a, _)| a.advisory.id);
+        advisories.sort_by(|(a, _), (b, _)| {
+            a.advisory
+                .id
+                .cmp(b.advisory.id)
+                .then_with(|| advisory_precedence(a).cmp(&advisory_precedence(b)))
+        });
+
+        // Collapse repeated `(advisory id, resolved package id)` observations
+        // from multiple databases. The precedence sort above ensures the
+        // strongest live record owns a shared identity, while package versions
+        // only matched by a weaker record are retained under that record.
+        let mut seen = std::collections::BTreeSet::<(String, crate::Kid)>::new();
+        let mut unique_advisories = Vec::with_capacity(advisories.len());
+        for (advisory, krates) in advisories {
+            let krates: Vec<_> = krates
+                .into_iter()
+                .filter(|krate| seen.insert((advisory.advisory.id.to_owned(), krate.id.clone())))
+                .collect();
+
+            if !krates.is_empty() {
+                unique_advisories.push((advisory, krates));
+            }
+        }
+        advisories = unique_advisories;
 
         Self {
             advisories,
@@ -360,7 +417,7 @@ impl Database {
 
         let mut advisories = std::collections::BTreeMap::<String, DbEntry>::new();
 
-        for entry in walkdir::WalkDir::new(&root) {
+        for entry in walkdir::WalkDir::new(&root).sort_by_file_name() {
             match entry {
                 Ok(entry) => {
                     if !entry.file_type().is_file() {
@@ -385,20 +442,39 @@ impl Database {
                         continue;
                     }
 
-                    if let Some(existing) = advisories.get(entry.advisory.advisory.id) {
-                        log::warn!(
-                            "ignoring advisory from '{}' with id '{}', an advisory with that id was already loaded from '{}'",
-                            entry.path,
-                            entry.advisory.advisory.id,
-                            existing.path
-                        );
-                    } else {
-                        assert!(
-                            advisories
-                                .insert(entry.advisory.advisory.id.to_owned(), entry)
-                                .is_none(),
-                            "we just inserted over an existing entry even though we just checked for it"
-                        );
+                    let id = entry.advisory.advisory.id.to_owned();
+                    match advisories.entry(id) {
+                        std::collections::btree_map::Entry::Vacant(vacant) => {
+                            vacant.insert(entry);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut occupied) => {
+                            let preferred = {
+                                let current = occupied.get();
+                                // Strong/live advisories have precedence over
+                                // weaker informational or withdrawn records.
+                                // For equal precedence use the lexicographically
+                                // first path so the winner is independent of
+                                // filesystem iteration order.
+                                (advisory_precedence(&entry.advisory), entry.path.as_str())
+                                    < (
+                                        advisory_precedence(&current.advisory),
+                                        current.path.as_str(),
+                                    )
+                            };
+
+                            let ignored = if preferred {
+                                occupied.insert(entry)
+                            } else {
+                                entry
+                            };
+
+                            log::warn!(
+                                "ignoring advisory from '{}' with id '{}', keeping advisory from '{}'",
+                                ignored.path,
+                                ignored.advisory.advisory.id,
+                                occupied.get().path,
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -447,7 +523,8 @@ pub fn find_unaffected_req<'v>(
     ) -> Option<&'v semver::VersionReq> {
         // We can't just blindly use semver's requirement checking here due to https://github.com/dtolnay/semver/issues/172
         if vers.pre.is_empty() {
-            return reqs.iter().find(|req| req.matches(vers));
+            let matching = reqs.iter().filter(|req| req.matches(vers));
+            return matching.min_by(|left, right| left.to_string().cmp(&right.to_string()));
         }
 
         use std::cmp::Ordering as Or;
@@ -493,7 +570,7 @@ pub fn find_unaffected_req<'v>(
             }
         }
 
-        reqs.iter().find(|req| {
+        let matching = reqs.iter().filter(|req| {
             // rustsec only allows up to 2 comparators https://github.com/rustsec/rustsec/blob/cf93efe036c112c5b2737857b991d12c15f43951/rustsec/src/osv/unaffected_range.rs#L116-L121
             fn cmp(comp: &semver::Comparator, vers: &semver::Version) -> bool {
                 use semver::Op;
@@ -616,10 +693,29 @@ pub fn find_unaffected_req<'v>(
             }
 
             req.comparators.iter().all(|comp| cmp(comp, vers))
-        })
+        });
+
+        // Overlapping requirements can match the same version. Select the
+        // canonical rendered requirement instead of relying on TOML/vector
+        // order, which gives the range a stable identity across runs.
+        matching.min_by(|left, right| left.to_string().cmp(&right.to_string()))
     }
 
     check(&versions.patched, version).or_else(|| check(&versions.unaffected, version))
+}
+
+/// Returns the stable identity of the patched/unaffected range that covers
+/// `version`, if any.
+///
+/// The identity is the canonical rendering of the selected `semver`
+/// requirement. Overlapping requirements therefore resolve to the same
+/// deterministic range regardless of their order in the advisory file.
+#[inline]
+pub fn stable_unaffected_range_id<'v>(
+    versions: &'v model::Versions,
+    version: &semver::Version,
+) -> Option<String> {
+    find_unaffected_req(versions, version).map(|req| req.to_string())
 }
 
 #[cfg(test)]

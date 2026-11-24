@@ -178,6 +178,11 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
                     let ignored = &self.cfg.ignore[index];
                     ignore = Some(ignored);
 
+                    // Record the withdrawn state immediately so it is never
+                    // lost when another ignore condition is also present. We
+                    // cannot return until expiry and dependent allow-list
+                    // checks have had a chance to invalidate the ignore and
+                    // restore the strong diagnostic.
                     if let Some(withdrawn) = md.withdrawn {
                         pack.push(diag(
                             Diagnostic::warning()
@@ -187,8 +192,6 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
                                 ),
                             Code::AdvisoryWithdrawn,
                         ));
-
-                        return pack;
                     }
 
                     if let Some(expiry) =
@@ -241,6 +244,12 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
                         }
                     }
 
+                    // A valid explicit ignore for a withdrawn advisory only
+                    // needs the removable-ignore warning emitted above.
+                    if md.withdrawn.is_some() {
+                        return pack;
+                    }
+
                     pack.push(diag(
                         Diagnostic::note()
                             .with_message("advisory ignored")
@@ -262,6 +271,14 @@ impl<'ctx> crate::CheckCtx<'ctx, super::cfg::ValidConfig> {
 
             (lint_level.into(), adv_ty)
         };
+
+        // A withdrawn advisory is not itself a strong vulnerability. The
+        // decision block above has still had a chance to emit expiry or
+        // dependent allow-list diagnostics, so those configuration problems
+        // are not swallowed by the withdrawn short-circuit.
+        if md.withdrawn.is_some() {
+            return pack;
+        }
 
         let mut notes = get_notes_from_advisory(md);
 

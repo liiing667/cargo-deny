@@ -82,6 +82,12 @@ pub fn check<R, S>(
     use bitvec::prelude::*;
     let mut ignore_hits: BitVec = BitVec::repeat(false, ctx.cfg.ignore.len());
     let mut ignore_yanked_hits: BitVec = BitVec::repeat(false, ctx.cfg.ignore_yanked.len());
+    // `Report` aggregates every configured database. The same advisory id can
+    // therefore be observed more than once, especially when one copy has been
+    // withdrawn and another database still carries the live record. Keying on
+    // the advisory and the full package id gives each vulnerability and
+    // resolved version exactly one public finding identity.
+    let mut emitted_findings = std::collections::BTreeSet::<(String, crate::Kid)>::new();
 
     use crate::cfg::Scope;
     let ws_set = if matches!(
@@ -103,8 +109,26 @@ pub fn check<R, S>(
         Default::default()
     };
 
+    // Duplicate records for the same advisory id are contiguous after stable
+    // sorting. Aggregate their direct dependents so the allow-list-missing
+    // diagnostic also has one stable advisory identity.
+    let mut allowed_id: Option<String> = None;
+    let mut allowed_ignore = None;
+    let mut allowed_dds = Vec::new();
+
     // Emit diagnostics for any advisories found that matched crates in the graph
     for (advisory, k) in &report.advisories {
+        if allowed_id.as_deref() != Some(advisory.advisory.id) {
+            if allowed_id.take().is_some() {
+                sink.push(
+                    ctx.diag_for_allowed_missing(allowed_ignore, std::mem::take(&mut allowed_dds)),
+                );
+                allowed_ignore = None;
+            }
+
+            allowed_id = Some(advisory.advisory.id.to_owned());
+        }
+
         let mut dds = Vec::new();
         let mut ignore = None;
 
@@ -159,6 +183,14 @@ pub fn check<R, S>(
                 }
             }
 
+            // Only reserve the identity once this record has passed scope
+            // filtering. A weaker duplicate skipped by scope must not hide a
+            // stronger canonical record that is processed later.
+            let finding_identity = (advisory.advisory.id.to_owned(), krate.id.clone());
+            if !emitted_findings.insert(finding_identity) {
+                continue 'krate;
+            }
+
             let diag = ctx.diag_for_advisory(
                 krate,
                 serialize_advisories,
@@ -176,7 +208,14 @@ pub fn check<R, S>(
             dds.append(&mut kdds);
         }
 
-        sink.push(ctx.diag_for_allowed_missing(ignore, dds));
+        if ignore.is_some() {
+            allowed_ignore = ignore;
+        }
+        allowed_dds.append(&mut dds);
+    }
+
+    if allowed_id.take().is_some() {
+        sink.push(ctx.diag_for_allowed_missing(allowed_ignore, std::mem::take(&mut allowed_dds)));
     }
 
     for (krate, status) in yanked {
