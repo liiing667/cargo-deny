@@ -1047,12 +1047,18 @@ pub fn check(
                             build_ctx.bypasses.lock().set(bcc, true);
                         }
 
-                        if let Some(mut l) = build_ctx.allowed.as_ref().map(|a| a.lock())
-                            && let Some((index, has_build_script)) = bci.allowed
+                        if let Some(allow_build_scripts) =
+                            build_ctx.build_config.allow_build_scripts.as_ref()
+                            && let Some(mut l) = build_ctx.allowed.as_ref().map(|a| a.lock())
                         {
-                            let ind = index * 2;
-                            l.set(ind, true);
-                            l.set(ind + 1, has_build_script);
+                            let has_build_script = bci.script_identity.is_some();
+                            for (index, spec) in allow_build_scripts.iter().enumerate() {
+                                if crate::match_krate(krate, spec) {
+                                    let ind = index * 2;
+                                    l.set(ind, true);
+                                    l.set(ind + 1, has_build_script);
+                                }
+                            }
                         }
 
                         if !pack.is_empty() {
@@ -1092,12 +1098,37 @@ pub fn check(
             .into_inner()
             .into_iter()
             .zip(bcc.build_config.bypass)
-            .filter_map(|(hit, ve)| if !hit { Some(ve) } else { None })
+            .filter_map(|(hit, ve)| (!hit).then_some(ve))
         {
             pack.push(diags::UnmatchedBypass {
                 unmatched: &ve,
                 file_id,
             });
+
+            // A bypass entry that never matched its owning crate cannot give
+            // its nested path/glob allowances a real crate boundary either.
+            // Emit each stale allowance as evidence instead of silently
+            // dropping the rest of the table.
+            for ae in &ve.allow {
+                pack.push(diags::UnmatchedPathBypass {
+                    unmatched: ae,
+                    file_id,
+                    crate_spec: Some(&ve.spec),
+                });
+            }
+
+            if let Some(vgs) = &ve.allow_globs {
+                for gp in vgs.patterns.iter().filter_map(|gp| match gp {
+                    cfg::GlobPattern::User(gp) => Some(gp),
+                    cfg::GlobPattern::Builtin(_) => None,
+                }) {
+                    pack.push(diags::UnmatchedGlob {
+                        unmatched: gp,
+                        file_id,
+                        crate_spec: Some(&ve.spec),
+                    });
+                }
+            }
         }
 
         if let Some((allowed, config)) = bcc.allowed.zip(bcc.build_config.allow_build_scripts) {
@@ -1174,11 +1205,101 @@ pub fn check(
     }
 }
 
+/// The stable identity of the Cargo target that actually executes as a build
+/// script.
+///
+/// An allowlist entry by crate name is not sufficient evidence on its own: the
+/// exact package id distinguishes crate versions/sources, while
+/// [`Self::script_path`] is the target's real source path rather than an
+/// assumed `build.rs` location.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScriptIdentity {
+    /// The exact package id, including name, version, and source.
+    pub crate_id: Kid,
+    /// The real build-script target path from Cargo metadata.
+    pub script_path: Option<crate::PathBuf>,
+    /// SHA-256 of [`Self::script_path`], when it could be read.
+    pub checksum: Option<cfg::Checksum>,
+}
+
+impl ScriptIdentity {
+    fn for_krate(krate: &Krate, script_path: Option<crate::PathBuf>) -> Self {
+        let checksum = script_path
+            .as_deref()
+            .and_then(|path| cfg::Checksum::checksum_file(path).ok());
+        Self {
+            crate_id: krate.id.clone(),
+            script_path,
+            checksum,
+        }
+    }
+
+    /// Exact Cargo package id for the script's owning crate.
+    pub fn crate_id(&self) -> &Kid {
+        &self.crate_id
+    }
+
+    /// Alias matching Cargo terminology for the exact owning package id.
+    pub fn krate(&self) -> &Kid {
+        &self.crate_id
+    }
+
+    /// Name of the owning crate.
+    pub fn name(&self) -> &str {
+        self.crate_id.name()
+    }
+
+    /// Locked version of the owning crate.
+    pub fn version(&self) -> &str {
+        self.crate_id.version()
+    }
+
+    /// Canonical source id of the owning crate.
+    pub fn source(&self) -> &str {
+        self.crate_id.source()
+    }
+
+    /// Real file backing the custom-build target.
+    pub fn path(&self) -> Option<&crate::Path> {
+        self.script_path.as_deref()
+    }
+
+    /// Actual checksum of the script file, if readable.
+    pub fn checksum(&self) -> Option<&cfg::Checksum> {
+        self.checksum.as_ref()
+    }
+}
+
+impl fmt::Debug for ScriptIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScriptIdentity")
+            .field("crate_id", &self.crate_id.repr)
+            .field("script_path", &self.script_path)
+            .field(
+                "checksum",
+                &self.checksum.as_ref().map(cfg::Checksum::to_string),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BuildCheckInfo {
     /// The index of the bypass configuration for the particular crate
     pub bypass_index: Option<usize>,
     /// The index of the allow-build-scripts config, and a bool indicating if it actually contained a build script or not
     pub allowed: Option<(usize, bool)>,
+    /// Identity binding the finding to the real script and owning crate.
+    ///
+    /// [`None`] when the crate has no custom-build target.
+    pub script_identity: Option<ScriptIdentity>,
+}
+
+impl BuildCheckInfo {
+    /// Identity binding the finding to the real script and owning crate.
+    pub fn script_identity(&self) -> Option<&ScriptIdentity> {
+        self.script_identity.as_ref()
+    }
 }
 
 pub fn check_build(
@@ -1191,12 +1312,18 @@ pub fn check_build(
 ) -> BuildCheckInfo {
     use krates::cm::TargetKind;
 
+    let build_script_path = krate.targets.iter().find_map(|t| {
+        t.kind
+            .contains(&TargetKind::CustomBuild)
+            .then(|| t.src_path.clone())
+    });
+    let script_identity = build_script_path
+        .clone()
+        .map(|path| ScriptIdentity::for_krate(krate, Some(path)));
+
     let (build_script_allowed, allowed) =
         if let Some(allow_build_scripts) = &config.allow_build_scripts {
-            let has_build_script = krate
-                .targets
-                .iter()
-                .any(|t| t.kind.contains(&TargetKind::CustomBuild));
+            let has_build_script = script_identity.is_some();
 
             let pos = allow_build_scripts
                 .iter()
@@ -1210,12 +1337,14 @@ pub fn check_build(
             (true, None)
         };
 
-    if build_script_allowed && config.executables == LintLevel::Allow {
-        return BuildCheckInfo {
-            bypass_index: None,
-            allowed,
-        };
-    }
+    // When executable detections are globally allowed, don't emit those
+    // findings. We can still walk the crate when it has path/glob rules so
+    // that matched and, importantly, unmatched narrow allowances leave
+    // evidence.
+    let mut allowlist_audit_only = build_script_allowed && config.executables == LintLevel::Allow;
+    // A matching trusted build-script checksum can suppress the coarse
+    // not-allowed denial while still auditing path/glob entries below.
+    let mut trusted_build_script = false;
 
     #[inline]
     fn executes_at_buildtime(krate: &Krate) -> bool {
@@ -1265,6 +1394,7 @@ pub fn check_build(
         return BuildCheckInfo {
             bypass_index: None,
             allowed,
+            script_identity,
         };
     }
 
@@ -1278,13 +1408,9 @@ pub fn check_build(
     let ret = BuildCheckInfo {
         bypass_index,
         allowed,
+        script_identity: script_identity.clone(),
     };
-
-    let build_script_path = krate.targets.iter().find_map(|t| {
-        t.kind
-            .contains(&TargetKind::CustomBuild)
-            .then_some(&t.src_path)
-    });
+    let build_script_path = build_script_path.as_deref();
 
     // If the build script hashes to the same value and required features are not actually
     // set on the crate, we can skip it
@@ -1321,16 +1447,28 @@ pub fn check_build(
                     .filter(|f| enabled.contains(&f.value))
                     .collect();
 
-                // If none of the required-features are present then we
-                // can skip the rest of the check
+                // If none of the required-features are present then executable
+                // inspection can be skipped. Still audit path/glob allowances
+                // if the user configured them so stale entries are reported.
                 if enabled_features.is_empty() {
-                    return ret;
-                }
+                    let has_file_allowlist = !kc.allow.is_empty()
+                        || kc
+                            .allow_globs
+                            .as_ref()
+                            .is_some_and(|globs| !globs.patterns.is_empty());
 
-                pack.push(diags::FeaturesEnabled {
-                    enabled_features,
-                    file_id,
-                });
+                    if has_file_allowlist {
+                        allowlist_audit_only = true;
+                        trusted_build_script = true;
+                    } else {
+                        return ret;
+                    }
+                } else {
+                    pack.push(diags::FeaturesEnabled {
+                        enabled_features,
+                        file_id,
+                    });
+                }
             }
             Ok((false, calculated)) => {
                 pack.push(diags::ChecksumMismatch {
@@ -1355,19 +1493,35 @@ pub fn check_build(
         }
     }
 
-    if !build_script_allowed {
-        let build_script = build_script_path.and_then(|path| {
-            let root = krate.manifest_path.parent().unwrap();
-            cfg::Checksum::checksum_file(path)
-                .ok()
-                .map(|checksum| (diags::HomePath { path, root, home }, checksum))
-        });
+    if !build_script_allowed && !trusted_build_script {
+        let root = krate.manifest_path.parent().unwrap();
+        let script_path = build_script_path.map(|path| diags::HomePath { path, root, home });
+        let checksum = script_identity
+            .as_ref()
+            .and_then(|identity| identity.checksum.clone())
+            .or_else(|| build_script_path.and_then(|path| cfg::Checksum::checksum_file(path).ok()));
 
         pack.push(diags::BuildScriptNotAllowed {
             krate,
-            build_script,
+            script_path,
+            checksum,
         });
 
+        return ret;
+    }
+
+    let has_file_allowlist = krate_config.is_some_and(|kc| {
+        !kc.allow.is_empty()
+            || kc
+                .allow_globs
+                .as_ref()
+                .is_some_and(|globs| !globs.patterns.is_empty())
+    });
+
+    // In audit-only mode there is no executable detection to perform. If
+    // there are also no path/glob rules to account for, the build-script
+    // checksum/feature diagnostics above are the complete result.
+    if allowlist_audit_only && !has_file_allowlist {
         return ret;
     }
 
@@ -1473,34 +1627,40 @@ pub fn check_build(
                     }
                 }
 
-                // Check if the file matches a disallowed glob pattern
-                if let Some(globs) = config.script_extensions.matches(&candidate, &mut matches) {
-                    pack.push(diags::DeniedByExtension {
-                        path: diags::HomePath { path, root, home },
-                        globs,
-                        file_id,
-                    });
-                    continue;
+                // In audit-only mode every non-allowlisted file is simply not
+                // part of the narrow allowlist evidence; the global policy has
+                // already allowed executable findings.
+                if !allowlist_audit_only {
+                    // Check if the file matches a disallowed glob pattern
+                    if let Some(globs) = config.script_extensions.matches(&candidate, &mut matches)
+                    {
+                        pack.push(diags::DeniedByExtension {
+                            path: diags::HomePath { path, root, home },
+                            globs,
+                            file_id,
+                        });
+                        continue;
+                    }
+
+                    // Save the most ambiguous/expensive check for last, does this look
+                    // like a native executable or script without extension?
+                    let diag: Diag = match check_is_executable(path, !config.include_archives) {
+                        Ok(None) => continue,
+                        Ok(Some(exe_kind)) => diags::DetectedExecutable {
+                            path: diags::HomePath { path, root, home },
+                            interpreted: config.interpreted,
+                            exe_kind,
+                        }
+                        .into(),
+                        Err(error) => diags::UnableToCheckPath {
+                            path: diags::HomePath { path, root, home },
+                            error,
+                        }
+                        .into(),
+                    };
+
+                    pack.push(diag);
                 }
-
-                // Save the most ambiguous/expensive check for last, does this look
-                // like a native executable or script without extension?
-                let diag: Diag = match check_is_executable(path, !config.include_archives) {
-                    Ok(None) => continue,
-                    Ok(Some(exe_kind)) => diags::DetectedExecutable {
-                        path: diags::HomePath { path, root, home },
-                        interpreted: config.interpreted,
-                        exe_kind,
-                    }
-                    .into(),
-                    Err(error) => diags::UnableToCheckPath {
-                        path: diags::HomePath { path, root, home },
-                        error,
-                    }
-                    .into(),
-                };
-
-                pack.push(diag);
             }
 
             if let Some(ae) = krate_config.map(|kc| &kc.allow) {
@@ -1512,6 +1672,7 @@ pub fn check_build(
                     pack.push(diags::UnmatchedPathBypass {
                         unmatched: ae,
                         file_id,
+                        crate_spec: None,
                     });
                 }
             }
@@ -1531,6 +1692,7 @@ pub fn check_build(
                     pack.push(diags::UnmatchedGlob {
                         unmatched: gp,
                         file_id,
+                        crate_spec: None,
                     });
                 }
             }

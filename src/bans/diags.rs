@@ -449,7 +449,8 @@ impl From<UnmatchedSkipRoot> for Diag {
 
 pub(crate) struct BuildScriptNotAllowed<'a> {
     pub(crate) krate: &'a Krate,
-    pub(crate) build_script: Option<(HomePath<'a>, super::cfg::Checksum)>,
+    pub(crate) script_path: Option<HomePath<'a>>,
+    pub(crate) checksum: Option<super::cfg::Checksum>,
 }
 
 impl<'a> From<BuildScriptNotAllowed<'a>> for Diag {
@@ -459,11 +460,15 @@ impl<'a> From<BuildScriptNotAllowed<'a>> for Diag {
             bs.krate
         ));
 
-        if let Some((path, checksum)) = bs.build_script {
-            diagnostic = diagnostic.with_notes(vec![
-                format!("path = '{path}'"),
-                format!("checksum = '{checksum}'"),
-            ]);
+        let mut notes = Vec::new();
+        if let Some(path) = bs.script_path {
+            notes.push(format!("path = '{path}'"));
+        }
+        if let Some(checksum) = bs.checksum {
+            notes.push(format!("checksum = '{checksum}'"));
+        }
+        if !notes.is_empty() {
+            diagnostic = diagnostic.with_notes(notes);
         }
 
         diag(diagnostic, Code::BuildScriptNotAllowed)
@@ -970,32 +975,40 @@ impl<'a> From<UnmatchedBypass<'a>> for Diag {
 pub(crate) struct UnmatchedPathBypass<'a> {
     pub(crate) unmatched: &'a super::cfg::BypassPath,
     pub(crate) file_id: FileId,
+    pub(crate) crate_spec: Option<&'a crate::cfg::PackageSpec>,
 }
 
 impl<'a> From<UnmatchedPathBypass<'a>> for Diag {
     fn from(ua: UnmatchedPathBypass<'a>) -> Self {
-        diag(
-            Diagnostic::new(Severity::Warning)
-                .with_message("allowed path was not encountered")
-                .with_labels(vec![Label::primary(ua.file_id, ua.unmatched.path.span)]),
-            Code::UnmatchedPathBypass,
-        )
+        let mut diagnostic = Diagnostic::new(Severity::Warning)
+            .with_message("allowed path was not encountered")
+            .with_labels(vec![Label::primary(ua.file_id, ua.unmatched.path.span)]);
+
+        if let Some(spec) = ua.crate_spec {
+            diagnostic = diagnostic.with_notes(vec![format!("bypass crate = '{spec}'")]);
+        }
+
+        diag(diagnostic, Code::UnmatchedPathBypass)
     }
 }
 
 pub(crate) struct UnmatchedGlob<'a> {
     pub(crate) unmatched: &'a Spanned<String>,
     pub(crate) file_id: FileId,
+    pub(crate) crate_spec: Option<&'a crate::cfg::PackageSpec>,
 }
 
 impl<'a> From<UnmatchedGlob<'a>> for Diag {
     fn from(ug: UnmatchedGlob<'a>) -> Self {
-        diag(
-            Diagnostic::new(Severity::Warning)
-                .with_message("glob was not encountered")
-                .with_labels(vec![Label::primary(ug.file_id, ug.unmatched.span)]),
-            Code::UnmatchedGlob,
-        )
+        let mut diagnostic = Diagnostic::new(Severity::Warning)
+            .with_message("glob was not encountered")
+            .with_labels(vec![Label::primary(ug.file_id, ug.unmatched.span)]);
+
+        if let Some(spec) = ug.crate_spec {
+            diagnostic = diagnostic.with_notes(vec![format!("bypass crate = '{spec}'")]);
+        }
+
+        diag(diagnostic, Code::UnmatchedGlob)
     }
 }
 

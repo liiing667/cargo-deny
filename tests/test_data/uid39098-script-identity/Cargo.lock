@@ -1,0 +1,5 @@
+version = 4
+
+[[package]]
+name = "uid39098-script-identity"
+version = "0.1.0"

@@ -283,7 +283,7 @@ pub struct Pack {
 
 impl Pack {
     #[inline]
-    pub(crate) fn new(check: Check) -> Self {
+    pub fn new(check: Check) -> Self {
         Self {
             check,
             diags: Vec::new(),
@@ -292,7 +292,7 @@ impl Pack {
     }
 
     #[inline]
-    pub(crate) fn with_kid(check: Check, kid: Kid) -> Self {
+    pub fn with_kid(check: Check, kid: Kid) -> Self {
         Self {
             check,
             diags: Vec::new(),

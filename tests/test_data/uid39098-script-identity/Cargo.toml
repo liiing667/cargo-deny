@@ -1,0 +1,7 @@
+[package]
+name = "uid39098-script-identity"
+version = "0.1.0"
+edition = "2021"
+build = "builder/main.rs"
+
+[workspace]
