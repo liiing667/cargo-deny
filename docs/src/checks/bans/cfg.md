@@ -20,6 +20,8 @@ Determines what happens when multiple versions of the same crate are encountered
 
 If `true`, `dev-dependencies` are included when checking for multiple versions of crates. By default this is false, and any crates that are only reached via dev dependency edges are ignored when checking for multiple versions. Note that this also means that `skip` and `skip` tree are not used, which may lead to warnings about unused configuration.
 
+An explicit [`deny-multiple-versions`](#deny-multiple-versions) rule is still enforced for versions that are only reachable through dev dependency edges. The finding retains the original dependency edges for those versions so the scope can be audited.
+
 ### `wildcards`
 
 Determines what happens when a dependency is specified with the `*` (wildcard) version.

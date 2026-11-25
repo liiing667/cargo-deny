@@ -1,0 +1,15 @@
+[package]
+name = "duplicate-scope-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dupe1 = { package = "dupe", path = "../dep-v1" }
+dupe3 = { package = "dupe", path = "../dep-v3" }
+
+[dev-dependencies]
+# The same version is reachable through both a normal and a dev edge. The
+# normal edge must win so text and JSON inclusion graphs agree on the scope.
+dupe1 = { package = "dupe", path = "../dep-v1" }
+# This version is only reachable through a dev edge and is filtered by default.
+dupe2 = { package = "dupe", path = "../dep-v2" }

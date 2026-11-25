@@ -165,15 +165,7 @@ impl<'a> InclusionGrapher<'a> {
             // If we're not adding features we need to walk up any feature edges
             // until we reach an actual crate dependenc
 
-            node_parents.extend(
-                self.krates
-                    .direct_dependents(np.node)
-                    .into_iter()
-                    .map(|dd| NodePrint {
-                        node: dd.node_id,
-                        edge: Some(dd.edge_id),
-                    }),
-            );
+            node_parents.extend(self.direct_dependents(np.node));
         }
 
         let parents = if !node_parents.is_empty() {
@@ -202,6 +194,75 @@ impl<'a> InclusionGrapher<'a> {
             repeat: false,
             parents,
         })
+    }
+
+    /// Returns one parent edge per crate that directly depends on `nid`.
+    ///
+    /// A crate can depend on the same package more than once, for example as
+    /// both a normal and a dev dependency. `Krates::direct_dependents` dedupes
+    /// those parents and returns whichever edge happens to be encountered
+    /// first, which makes the scope label in JSON output depend on graph
+    /// insertion order. Pick the strongest kind instead so the JSON inclusion
+    /// graph agrees with the dotgraph and with duplicate filtering.
+    fn direct_dependents(&self, nid: krates::NodeId) -> Vec<NodePrint> {
+        use pg::visit::EdgeRef;
+
+        let graph = self.krates.graph();
+        let mut stack = vec![nid];
+        let mut visited = HashSet::new();
+        let mut parents =
+            std::collections::BTreeMap::<krates::NodeId, (u8, pg::graph::EdgeIndex<u32>)>::new();
+
+        #[inline]
+        fn rank(kind: &DepKind) -> u8 {
+            match kind {
+                DepKind::Normal => 3,
+                DepKind::Build => 2,
+                DepKind::Dev => 1,
+            }
+        }
+
+        while let Some(nid) = stack.pop() {
+            if !visited.insert(nid) {
+                continue;
+            }
+
+            for edge in graph.edges_directed(nid, pg::Direction::Incoming) {
+                match &graph[edge.source()] {
+                    Node::Krate { .. } => {
+                        if let Edge::Dep { kind, .. } | Edge::DepFeature { kind, .. } =
+                            edge.weight()
+                        {
+                            let rank = rank(kind);
+                            match parents.entry(edge.source()) {
+                                std::collections::btree_map::Entry::Occupied(mut it) => {
+                                    let entry = it.get_mut();
+                                    if rank > entry.0 {
+                                        *entry = (rank, edge.id());
+                                    }
+                                }
+                                std::collections::btree_map::Entry::Vacant(it) => {
+                                    it.insert((rank, edge.id()));
+                                }
+                            }
+                        }
+                    }
+                    Node::Feature { krate_index, .. } => {
+                        if *krate_index == nid {
+                            stack.push(edge.source());
+                        }
+                    }
+                }
+            }
+        }
+
+        parents
+            .into_iter()
+            .map(|(node, (_, edge))| NodePrint {
+                node,
+                edge: Some(edge),
+            })
+            .collect()
     }
 }
 

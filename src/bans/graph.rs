@@ -1,4 +1,4 @@
-use super::cfg::GraphHighlight;
+use super::{ScopeIdentity, cfg::GraphHighlight, strongest_kind};
 use crate::{DepKind, Kid};
 use anyhow::{Context, Error};
 use krates::petgraph as pg;
@@ -59,32 +59,32 @@ pub(crate) fn create_graph(
     dup_name: &str,
     highlight: GraphHighlight,
     krates: &crate::Krates,
-    dup_ids: &[(usize, bool)],
+    scope_identity: &ScopeIdentity,
 ) -> Result<String, Error> {
     use pg::visit::{EdgeRef, NodeRef};
 
     let mut graph = pg::Graph::new();
     let mut node_map = BTreeMap::new();
 
-    let mut node_stack = Vec::with_capacity(dup_ids.len());
+    let mut node_stack = Vec::with_capacity(scope_identity.versions.len());
 
-    let duplicates: Vec<_> = dup_ids
+    let duplicates: Vec<_> = scope_identity
+        .versions
         .iter()
-        .filter_map(|(di, skipped)| (!*skipped).then_some(krates[*di].id.clone()))
+        .map(|version| version.krate.clone())
         .collect();
 
-    for (index, dupid) in dup_ids
-        .iter()
-        .filter_map(|(index, skipped)| (!*skipped).then_some(*index))
-        .zip(duplicates.iter())
-    {
+    for dupid in &duplicates {
+        let krate_nid = krates
+            .nid_for_kid(dupid)
+            .with_context(|| format!("unable to find duplicate crate {dupid} in the graph"))?;
         let dn = DupNode {
             kid: dupid,
             feature: None,
         };
-        let nid = graph.add_node(dn);
-        node_map.insert(dn, nid);
-        node_stack.push((krates::NodeId::new(index), nid));
+        let graph_nid = graph.add_node(dn);
+        node_map.insert(dn, graph_nid);
+        node_stack.push((krate_nid, graph_nid));
     }
 
     {
@@ -105,7 +105,8 @@ pub(crate) fn create_graph(
                                 };
 
                                 if let Some(pindex) = node_map.get(&dn) {
-                                    graph.update_edge(*pindex, target, *kind);
+                                    let edge = graph.update_edge(*pindex, target, *kind);
+                                    graph[edge] = strongest_kind(graph[edge], *kind);
                                 } else {
                                     let pindex = graph.add_node(DupNode {
                                         kid: &krate.id,

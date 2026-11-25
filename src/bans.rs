@@ -11,6 +11,7 @@ use crate::{
 };
 use anyhow::Error;
 pub use diags::Code;
+use krates::DepKind;
 use krates::cm::DependencyKind;
 use semver::VersionReq;
 use std::fmt;
@@ -175,14 +176,484 @@ impl TreeSkipper {
     }
 }
 
+#[derive(Clone, Default)]
 pub struct DupGraph {
     pub duplicate: String,
     pub graph: String,
+    /// Stable description of which crate versions, dependency edges and scopes
+    /// produced this duplicate finding.
+    ///
+    /// The graph string above is meant for humans, but it deliberately only
+    /// contains the versions that survived the `skip`/dev filtering. Consumers
+    /// (JSON output, SARIF, third party tooling) need a structured identity so
+    /// they can tell findings apart and, importantly, map a filtered finding
+    /// back to the original dependency edges it came from.
+    pub scope_identity: ScopeIdentity,
 }
 
 impl fmt::Debug for DupGraph {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.graph)
+    }
+}
+
+impl DupGraph {
+    /// The structured identity for this duplicate finding.
+    #[inline]
+    pub fn scope_identity(&self) -> &ScopeIdentity {
+        &self.scope_identity
+    }
+
+    /// Alias for [`Self::scope_identity`].
+    #[inline]
+    pub fn identity(&self) -> &ScopeIdentity {
+        &self.scope_identity
+    }
+
+    /// Alias for [`Self::scope_identity`].
+    #[inline]
+    pub fn scope(&self) -> &ScopeIdentity {
+        &self.scope_identity
+    }
+
+    /// The versions that are part of this finding.
+    #[inline]
+    pub fn versions(&self) -> &[VersionScope] {
+        self.scope_identity.versions()
+    }
+}
+
+/// The graph scope a duplicate version was found in.
+///
+/// A version can be both a workspace member and reachable through dev edges;
+/// [`ScopeKind::Workspace`] takes precedence because workspace members are
+/// always roots of the cargo dependency graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScopeKind {
+    /// The crate is a member of the workspace.
+    Workspace,
+    /// The crate is reachable through at least one normal or build edge.
+    Transitive,
+    /// The crate is only reachable through one or more dev dependency edges.
+    Dev,
+}
+
+impl ScopeKind {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Transitive => "transitive",
+            Self::Dev => "dev",
+        }
+    }
+}
+
+impl fmt::Display for ScopeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The dependency kind of an original graph edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EdgeKind {
+    /// A normal dependency edge.
+    Normal,
+    /// A build dependency edge.
+    Build,
+    /// A dev dependency edge.
+    Dev,
+}
+
+impl EdgeKind {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Build => "build",
+            Self::Dev => "dev",
+        }
+    }
+
+    /// Returns the edge kind as a `krates` dependency kind.
+    #[inline]
+    pub fn dep_kind(self) -> DepKind {
+        match self {
+            Self::Normal => DepKind::Normal,
+            Self::Build => DepKind::Build,
+            Self::Dev => DepKind::Dev,
+        }
+    }
+}
+
+impl From<DepKind> for EdgeKind {
+    #[inline]
+    fn from(kind: DepKind) -> Self {
+        match kind {
+            DepKind::Normal => Self::Normal,
+            DepKind::Build => Self::Build,
+            DepKind::Dev => Self::Dev,
+        }
+    }
+}
+
+impl fmt::Display for EdgeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A dependency edge from another crate to the version in a duplicate finding.
+///
+/// `edge_id` and `cfg` are copied straight from the original `krates` graph;
+/// filtering a version out of the duplicate set never removes these edges, so
+/// the original inclusion path remains auditable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeEdge {
+    /// The crate that declares the dependency.
+    pub parent: Kid,
+    /// The kind of the original Cargo dependency edge.
+    pub kind: EdgeKind,
+    /// The target-specific configuration attached to the edge, if any.
+    pub cfg: Option<String>,
+    /// The index of the edge in the original `krates` dependency graph.
+    pub edge_id: usize,
+}
+
+impl ScopeEdge {
+    /// The parent crate for this edge.
+    #[inline]
+    pub fn parent(&self) -> &Kid {
+        &self.parent
+    }
+
+    /// The original dependency kind.
+    #[inline]
+    pub fn kind(&self) -> EdgeKind {
+        self.kind
+    }
+
+    /// The original graph edge id.
+    #[inline]
+    pub fn edge_id(&self) -> usize {
+        self.edge_id
+    }
+
+    /// Whether this is a dev dependency edge.
+    #[inline]
+    pub fn is_dev(&self) -> bool {
+        self.kind == EdgeKind::Dev
+    }
+}
+
+impl serde::Serialize for ScopeEdge {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ScopeEdge", 4)?;
+        state.serialize_field("parent", &self.parent.repr)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("cfg", &self.cfg)?;
+        state.serialize_field("edge_id", &self.edge_id)?;
+        state.end()
+    }
+}
+
+/// Why a version did or did not participate in a duplicate finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VersionStatus {
+    /// The version is part of the public finding.
+    Included,
+    /// The version was explicitly skipped by configuration.
+    Skipped,
+    /// The version was removed because dev dependencies are ignored.
+    DevFiltered,
+}
+
+impl VersionStatus {
+    #[inline]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Included => "included",
+            Self::Skipped => "skipped",
+            Self::DevFiltered => "dev-filtered",
+        }
+    }
+}
+
+/// The identity of one crate version in a duplicate finding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionScope {
+    /// The exact package id, including name, version and source.
+    pub krate: Kid,
+    /// The scope the version was attributed to.
+    pub scope: ScopeKind,
+    /// How this version relates to the public finding.
+    pub status: VersionStatus,
+    /// Original dependency edges that reach this version.
+    pub edges: Vec<ScopeEdge>,
+}
+
+impl VersionScope {
+    /// The exact package id for this version.
+    #[inline]
+    pub fn krate(&self) -> &Kid {
+        &self.krate
+    }
+
+    /// The crate name.
+    #[inline]
+    pub fn name(&self) -> &str {
+        self.krate.name()
+    }
+
+    /// The locked crate version.
+    #[inline]
+    pub fn version(&self) -> &str {
+        self.krate.version()
+    }
+
+    /// The source id for this version.
+    #[inline]
+    pub fn source(&self) -> &str {
+        self.krate.source()
+    }
+
+    /// The scope this version belongs to.
+    #[inline]
+    pub fn scope(&self) -> ScopeKind {
+        self.scope
+    }
+
+    /// The original dependency edges reaching this version.
+    #[inline]
+    pub fn edges(&self) -> &[ScopeEdge] {
+        &self.edges
+    }
+
+    /// Whether the version survived dev-dependency filtering for this finding.
+    #[inline]
+    pub fn is_included(&self) -> bool {
+        self.status == VersionStatus::Included
+    }
+
+    /// Whether the version was only reachable through dev edges.
+    #[inline]
+    pub fn is_dev(&self) -> bool {
+        self.scope == ScopeKind::Dev
+    }
+}
+
+impl serde::Serialize for VersionScope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("VersionScope", 7)?;
+        state.serialize_field("krate", &self.krate.repr)?;
+        state.serialize_field("name", self.name())?;
+        state.serialize_field("version", self.version())?;
+        state.serialize_field("source", self.source())?;
+        state.serialize_field("scope", &self.scope)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("edges", &self.edges)?;
+        state.end()
+    }
+}
+
+/// Stable identity for a duplicate-version finding.
+///
+/// The included versions are the ones reported to users, while
+/// [`Self::filtered_versions`] and [`Self::skipped_versions`] retain the
+/// versions and original edges that were removed by the corresponding scope
+/// filter, so a consumer can still explain where the finding came from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScopeIdentity {
+    /// The duplicate crate name.
+    pub duplicate: String,
+    /// Versions that are part of the reported finding.
+    pub versions: Vec<VersionScope>,
+    /// Versions removed because dev dependencies are excluded.
+    pub filtered_versions: Vec<VersionScope>,
+    /// Versions removed by an explicit `skip`/`skip-tree` rule.
+    pub skipped_versions: Vec<VersionScope>,
+}
+
+impl ScopeIdentity {
+    /// The duplicate crate name.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.duplicate
+    }
+
+    /// Versions that are part of the finding.
+    #[inline]
+    pub fn versions(&self) -> &[VersionScope] {
+        &self.versions
+    }
+
+    /// Versions removed by dev filtering, with their original edges intact.
+    #[inline]
+    pub fn filtered_versions(&self) -> &[VersionScope] {
+        &self.filtered_versions
+    }
+
+    /// Versions removed by explicit skip configuration.
+    #[inline]
+    pub fn skipped_versions(&self) -> &[VersionScope] {
+        &self.skipped_versions
+    }
+
+    /// Whether the identity contains any reported version.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+
+    /// The number of versions in the finding.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.versions.len()
+    }
+
+    /// Iterate over the versions in the finding.
+    pub fn iter(&self) -> impl Iterator<Item = &VersionScope> {
+        self.versions.iter()
+    }
+}
+
+impl std::ops::Deref for ScopeIdentity {
+    type Target = [VersionScope];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.versions
+    }
+}
+
+impl<'a> IntoIterator for &'a ScopeIdentity {
+    type Item = &'a VersionScope;
+    type IntoIter = std::slice::Iter<'a, VersionScope>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.versions.iter()
+    }
+}
+
+impl serde::Serialize for ScopeIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ScopeIdentity", 4)?;
+        state.serialize_field("duplicate", &self.duplicate)?;
+        state.serialize_field("versions", &self.versions)?;
+        state.serialize_field("filtered_versions", &self.filtered_versions)?;
+        state.serialize_field("skipped_versions", &self.skipped_versions)?;
+        state.end()
+    }
+}
+
+/// Chooses the strongest dependency kind when the same parent reaches a crate
+/// through more than one edge.
+///
+/// Normal edges are what make a dependency part of the regular workspace graph,
+/// followed by build edges, and finally dev edges. Choosing deterministically is
+/// important because the text dotgraph and JSON inclusion graph must report the
+/// same scope for a crate that is both a normal and a dev dependency.
+#[inline]
+pub(crate) fn strongest_kind(a: DepKind, b: DepKind) -> DepKind {
+    #[inline]
+    fn rank(kind: DepKind) -> u8 {
+        match kind {
+            DepKind::Normal => 3,
+            DepKind::Build => 2,
+            DepKind::Dev => 1,
+        }
+    }
+
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+/// Collects every original crate dependency edge that points at `krate`.
+///
+/// This intentionally does not collapse parallel normal/dev/build edges. The
+/// returned edges are sorted by edge id so the identity is deterministic.
+fn scope_edges(krates: &Krates, krate: &Krate) -> Vec<ScopeEdge> {
+    use krates::petgraph::{Direction, visit::EdgeRef};
+
+    let graph = krates.graph();
+    let Some(nid) = krates.nid_for_kid(&krate.id) else {
+        return Vec::new();
+    };
+
+    let mut edges = Vec::new();
+    let mut stack = vec![nid];
+    let mut visited = std::collections::BTreeSet::new();
+
+    while let Some(nid) = stack.pop() {
+        if !visited.insert(nid) {
+            continue;
+        }
+
+        for edge in graph.edges_directed(nid, Direction::Incoming) {
+            match &graph[edge.source()] {
+                krates::Node::Krate { krate: parent, .. } => {
+                    if let krates::Edge::Dep { kind, cfg }
+                    | krates::Edge::DepFeature { kind, cfg } = edge.weight()
+                    {
+                        edges.push(ScopeEdge {
+                            parent: parent.id.clone(),
+                            kind: (*kind).into(),
+                            cfg: cfg.clone(),
+                            edge_id: edge.id().index(),
+                        });
+                    }
+                }
+                krates::Node::Feature { krate_index, .. } if *krate_index == nid => {
+                    stack.push(edge.source());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    edges.sort_unstable_by_key(|edge| edge.edge_id);
+    edges
+}
+
+fn version_scope(
+    krates: &Krates,
+    krate: &Krate,
+    status: VersionStatus,
+    is_workspace_member: bool,
+    dev_only: bool,
+) -> VersionScope {
+    let scope = if is_workspace_member {
+        ScopeKind::Workspace
+    } else if dev_only {
+        ScopeKind::Dev
+    } else {
+        ScopeKind::Transitive
+    };
+
+    VersionScope {
+        krate: krate.id.clone(),
+        scope,
+        status,
+        edges: scope_edges(krates, krate),
     }
 }
 
@@ -329,22 +800,31 @@ pub fn check(
         krates_with_dupes: Vec::new(),
     };
 
-    let filtered_krates = if !multiple_versions_include_dev {
-        ctx.krates.krates_filtered(krates::DepKind::Dev)
-    } else {
-        Vec::new()
+    let filtered_krates = ctx.krates.krates_filtered(krates::DepKind::Dev);
+
+    // A crate is dev-only when removing dev edges from the workspace roots
+    // removes it from the graph. Keep the original graph intact; this predicate
+    // is only used to decide whether a version participates in the finding.
+    let is_dev_only = |kid: &Kid| {
+        filtered_krates
+            .binary_search_by(|krate| krate.id.cmp(kid))
+            .is_err()
     };
 
     // If we're not counting dev dependencies as duplicates, create a separate
     // set of krates with dev dependencies filtered out
-    let should_add_dupe = move |kid| {
-        if multiple_versions_include_dev {
-            true
-        } else {
-            filtered_krates
-                .binary_search_by(|krate| krate.id.cmp(kid))
-                .is_ok()
+    let should_add_dupe = |kid| multiple_versions_include_dev || !is_dev_only(kid);
+
+    // Group every version by name up front. Some versions never make it into
+    // `multi_detector.dupes` because they are dev-only, but we still need them
+    // to decide whether an explicitly denied crate has a hidden duplicate, and
+    // to retain the original edges in the finding identity.
+    let krates_by_name: BTreeMap<&str, Vec<usize>> = {
+        let mut map = BTreeMap::<&str, Vec<usize>>::new();
+        for (i, krate) in ctx.krates.krates().enumerate() {
+            map.entry(krate.name.as_str()).or_default().push(i);
         }
+        map
     };
 
     let dmv = SpecsAndReasons(
@@ -383,29 +863,67 @@ pub fn check(
             .collect(),
     );
 
-    // Collect workspace members if allow_workspace is enabled
-    let workspace_members: std::collections::HashSet<Kid> = if allow_workspace {
-        let members: std::collections::HashSet<Kid> = ctx
-            .krates
-            .workspace_members()
-            .filter_map(|node| {
-                if let krates::Node::Krate { id, .. } = node {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
+    let all_workspace_members: std::collections::HashSet<Kid> = ctx
+        .krates
+        .workspace_members()
+        .filter_map(|node| {
+            if let krates::Node::Krate { id, .. } = node {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
 
-        members
+    // Collect workspace members if allow_workspace is enabled
+    let workspace_members = if allow_workspace {
+        all_workspace_members.clone()
     } else {
         std::collections::HashSet::new()
     };
 
     let report_duplicates = |multi_detector: &mut MultiDetector<'_>, sink: &mut diag::ErrorSink| {
-        if multi_detector.dupes.len() != 1 {
+        let all_indices = krates_by_name
+            .get(multi_detector.name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        let already_selected: std::collections::BTreeSet<usize> = multi_detector
+            .dupes
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+
+        // These versions exist in the real graph but were removed by the
+        // default dev-dependency filter. They are not part of the public
+        // finding unless an explicit `deny-multiple-versions` rule requires
+        // them, but we retain their identity and original edges for evidence.
+        let dev_filtered_indices: Vec<usize> = all_indices
+            .iter()
+            .copied()
+            .filter(|index| !already_selected.contains(index))
+            .collect();
+
+        let mut selected = multi_detector.dupes.to_vec();
+
+        // `multiple-versions = 'deny'` still follows the documented dev
+        // filtering behavior, but an explicit per-crate
+        // `deny-multiple-versions = true` must not be hidden merely because
+        // the other version is only reachable through a dev edge.
+        let explicitly_denied = all_indices
+            .iter()
+            .any(|index| dmv.matches(&ctx.krates[*index]).is_some());
+        if explicitly_denied && !multiple_versions_include_dev && !dev_filtered_indices.is_empty() {
+            log::debug!(
+                "crate '{}' has an explicitly denied duplicate that is only reachable through dev edges",
+                multi_detector.name
+            );
+            selected.extend(dev_filtered_indices.iter().map(|index| (*index, false)));
+        }
+
+        if selected.len() != 1 {
             // Filter out crates that depend on another version of themselves https://github.com/dtolnay/semver-trick
-            multi_detector.dupes.retain(|(index, _)| {
+            selected.retain(|(index, _)| {
                 let krate = &ctx.krates[*index];
 
                 // We _could_ just see if this crate's dependencies is another
@@ -427,20 +945,16 @@ pub fn check(
             });
         }
 
-        let skipped = multi_detector
-            .dupes
-            .iter()
-            .filter(|(_, skipped)| *skipped)
-            .count();
-        if multi_detector.dupes.len() > 1 {
+        let skipped = selected.iter().filter(|(_, skipped)| *skipped).count();
+        if selected.len() > 1 {
             multi_detector.krates_with_dupes.push(multi_detector.name);
         }
 
-        if multi_detector.dupes.len() - skipped <= 1 {
+        if selected.len() - skipped <= 1 {
             return;
         }
 
-        let lint_level = if multi_detector.dupes.iter().any(|(kindex, skipped)| {
+        let lint_level = if selected.iter().any(|(kindex, skipped)| {
             if *skipped {
                 return false;
             }
@@ -471,8 +985,7 @@ pub fn check(
 
         let mut kids = smallvec::SmallVec::<[Dupe; 2]>::new();
 
-        for dup in multi_detector
-            .dupes
+        for dup in selected
             .iter()
             .filter_map(|(ind, skipped)| (!*skipped).then_some(*ind))
         {
@@ -522,17 +1035,62 @@ pub fn check(
             sink.push(pack);
         }
 
-        if let Some(og) = &output_graph {
-            match graph::create_graph(
-                multi_detector.name,
-                highlight,
+        let selected_set: std::collections::BTreeSet<usize> =
+            selected.iter().map(|(index, _)| *index).collect();
+        let mut scope_identity = ScopeIdentity {
+            duplicate: multi_detector.name.to_owned(),
+            ..Default::default()
+        };
+
+        for (index, skipped) in &selected {
+            let krate = &ctx.krates[*index];
+            let status = if *skipped {
+                VersionStatus::Skipped
+            } else {
+                VersionStatus::Included
+            };
+            let version = version_scope(
                 ctx.krates,
-                &multi_detector.dupes,
-            ) {
+                krate,
+                status,
+                all_workspace_members.contains(&krate.id),
+                is_dev_only(&krate.id),
+            );
+
+            if *skipped {
+                scope_identity.skipped_versions.push(version);
+            } else {
+                scope_identity.versions.push(version);
+            }
+        }
+
+        for index in &dev_filtered_indices {
+            if selected_set.contains(index) {
+                continue;
+            }
+
+            let krate = &ctx.krates[*index];
+            scope_identity.filtered_versions.push(version_scope(
+                ctx.krates,
+                krate,
+                VersionStatus::DevFiltered,
+                all_workspace_members.contains(&krate.id),
+                true,
+            ));
+        }
+
+        let by_krate = |a: &VersionScope, b: &VersionScope| a.krate.cmp(&b.krate);
+        scope_identity.versions.sort_unstable_by(by_krate);
+        scope_identity.filtered_versions.sort_unstable_by(by_krate);
+        scope_identity.skipped_versions.sort_unstable_by(by_krate);
+
+        if let Some(og) = &output_graph {
+            match graph::create_graph(multi_detector.name, highlight, ctx.krates, &scope_identity) {
                 Ok(graph) => {
                     if let Err(err) = og(DupGraph {
                         duplicate: multi_detector.name.to_owned(),
                         graph,
+                        scope_identity,
                     }) {
                         log::error!("{err}");
                     }
